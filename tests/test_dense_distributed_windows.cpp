@@ -11,13 +11,17 @@
 //    disjoint (every cell visited exactly once),
 //  * Internal + Boundary tile Standard, Standard is the span's default window,
 //  * a slab (halo.x == halo.y == 0) yields at most two Boundary windows, both along Z,
-//  * with_window changes the window and nothing else.
+//  * with_window changes the window and nothing else,
+//  * the single pencil Boundary launch (pencil_boundary.h) visits exactly the Boundary windows'
+//    cells, each once, for several block shapes and thin / clamped chunks.
 //
 // What it does NOT cover: real kernel launches (see the dense_distributed_dist test).
 
 #include <carbon/boundary_mode_distributed.h>
 #include <carbon/data_view.h>
+#include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/detail/dense_distributed/span.h>
+#include <carbon/launch_shape.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -118,6 +122,60 @@ window_cells(const dd::Span& span, DataView view) -> Visits {
   return v;
 }
 
+// Buffer cells visited by the single pencil Boundary launch: every thread of pencil_boundary_grid
+// decoded by pencil_boundary_cell and shifted by halo(), exactly what
+// dense_pencil_boundary_kernel does.
+auto
+pencil_launch_cells(const dd::Span& span, carbon::LaunchShape block) -> Visits {
+  Visits v(span.haloed_extent());
+  const dd::PencilBoundaryLayout l = dd::pencil_boundary_layout(span);
+  const carbon::LaunchShape grid = dd::pencil_boundary_grid(l, block);
+  CHECK(grid.volume() == 0U ||
+        grid.z == static_cast<std::uint32_t>(dd::pencil_boundary_slices(l)));
+  const int64_3d h = span.halo();
+  for (std::uint32_t bz = 0; bz < grid.z; ++bz) {
+    for (std::uint32_t by = 0; by < grid.y; ++by) {
+      for (std::uint32_t bx = 0; bx < grid.x; ++bx) {
+        for (std::uint32_t ty = 0; ty < block.y; ++ty) {
+          for (std::uint32_t tx = 0; tx < block.x; ++tx) {
+            int64_3d c{};
+            if (dd::pencil_boundary_cell(l, bx, by, bz, tx, ty, block.x, block.y, c)) {
+              v.at(h.x + c.x, h.y + c.y, h.z + c.z) += 1;
+            }
+          }
+        }
+      }
+    }
+  }
+  return v;
+}
+
+// The single pencil Boundary launch visits exactly the cells of boundary_windows(), each once,
+// for several block shapes; a block with z > 1 falls back to the per-window launches.
+void
+check_pencil_launch(const int64_3d& owned, const int64_3d& halo) {
+  const int64_3d haloed{owned.x + 2 * halo.x, owned.y + 2 * halo.y, owned.z + 2 * halo.z};
+  const int64_3d global{owned.x * 2, owned.y * 2, owned.z * 2};
+  const dd::Span span(haloed, global, haloed.x * haloed.y, int64_3d{0, 0, 0}, halo,
+                      BoundaryModeDistributed::Open, /*legacy_slab=*/false);
+  g_ctx = describe(owned, halo, false);
+  CHECK(span.storage_kind() == dd::StorageKind::Pencil);
+  CHECK(!dd::uses_pencil_boundary_launch(span, carbon::LaunchShape{32U, 4U, 2U}));
+
+  const Visits want = window_cells(span, DataView::Boundary);
+  const carbon::LaunchShape blocks[] = {
+      {64U, 8U, 1U}, {32U, 4U, 1U}, {128U, 4U, 1U}, {32U, 1U, 1U}, {1U, 1U, 1U}};
+  for (const carbon::LaunchShape& block : blocks) {
+    g_ctx = describe(owned, halo, false) + " block=(" + std::to_string(block.x) + "," +
+            std::to_string(block.y) + ",1)";
+    CHECK(dd::uses_pencil_boundary_launch(span, block));
+    const Visits got = pencil_launch_cells(span, block);
+    for (size_t i = 0; i < want.count.size(); ++i) {
+      CHECK(got.count[i] == want.count[i]);
+    }
+  }
+}
+
 void
 check_span(const int64_3d& owned, const int64_3d& halo, bool legacy_slab) {
   g_ctx = describe(owned, halo, legacy_slab);
@@ -212,6 +270,27 @@ main() {
       }
     }
   }
-  std::printf("dense_distributed_windows: OK (%lld spans)\n", static_cast<long long>(spans_checked));
+
+  // Single pencil Boundary launch. Small chunks cover thin / clamped bands (including mz == 0);
+  // the larger ones have Y faces shorter (130x70x40) and taller (130x40x70) than the Z faces and
+  // extents that are not multiples of the block.
+  const int64_3d pencil_halos[] = {{0, 1, 1}, {0, 2, 2}, {0, 1, 2}, {0, 2, 1}, {0, 1, 0}};
+  int64_t pencil_checked = 0;
+  for (const int64_3d& halo : pencil_halos) {
+    for (const int64_t nx : sizes) {
+      for (const int64_t ny : sizes) {
+        for (const int64_t nz : sizes) {
+          check_pencil_launch(int64_3d{nx, ny, nz}, halo);
+          ++pencil_checked;
+        }
+      }
+    }
+    check_pencil_launch(int64_3d{130, 70, 40}, halo);
+    check_pencil_launch(int64_3d{130, 40, 70}, halo);
+    pencil_checked += 2;
+  }
+
+  std::printf("dense_distributed_windows: OK (%lld spans, %lld pencil launches)\n",
+              static_cast<long long>(spans_checked), static_cast<long long>(pencil_checked));
   return 0;
 }

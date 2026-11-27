@@ -22,6 +22,7 @@
 #include <carbon/data_view.h>
 #include <carbon/dense_distributed.h>
 #include <carbon/detail/dense_distributed/kernel.h>
+#include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/detail/dense_distributed/window_launch.h>
 #include <carbon/detail/gpu.h>
 #include <carbon/launch_shape.h>
@@ -123,6 +124,16 @@ launch_dense_grid(const ::carbon::DenseDistributed& grid,
   const ::carbon::detail::Gpu& gpu = grid.system().gpu_group().devices()[relative_gpu_id];
   const Span span = grid.spans()[relative_gpu_id];
   const dim3 dim_block = to_dim3(block_shape);
+
+  // Pencil Boundary: the four faces in one launch, blockIdx.z = face layer (pencil_boundary.h).
+  if (view == ::carbon::DataView::Boundary && uses_pencil_boundary_launch(span, block_shape)) {
+    const LaunchShape shape = pencil_boundary_grid(pencil_boundary_layout(span), block_shape);
+    if (!shape.is_nonzero()) {
+      return gpu_success;
+    }
+    return gpu.template typed_launch<&dense_pencil_boundary_kernel<F>>(
+        to_dim3(shape), dim_block, shared_mem, stream, TypedSpan<StorageKind::Pencil>{span}, fn);
+  }
 
   // One launch per non-empty window: Standard and Internal are a single box (same launch shape as
   // the precomputed @p grid_shape); Boundary is up to six boxes (two for a slab). The per-window

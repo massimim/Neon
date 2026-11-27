@@ -6717,3 +6717,22 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   `export_streams_dot()` / `export_streams_dot_file()`; the `*_streams.dot` sidecars of
   jacobi_nvidia, cg and LBM `--export-dot-streams`, and the tests that check its text
   (stream clusters, field labels, region-mask tooltips, the copy stream) use the new names.
+- **2026-11 — Pencil Boundary view in one launch.** A `DenseDistributed` Pencil span
+  (`halo.x == 0`, `halo.y > 0`) ran its Boundary view as four launches, one per face box, all
+  with the 64x8 block; the Y faces are one cell deep in y, so 7 of 8 threads exited at once.
+  `launch_dense_grid` now runs the four faces in one `dense_pencil_boundary_kernel` launch:
+  `blockIdx.z` selects face and halo layer, x / y stay `blockIdx * blockDim + threadIdx`, and on
+  the Y faces the second thread axis walks z (`detail/dense_distributed/pencil_boundary.h`, band
+  thicknesses from the new `Span::shell_bands()`). Used when the block has `z == 1`; Slab, Brick
+  and other blocks keep the per-window launches, as do reduce and SYCL. `gpu_grid(Boundary)`
+  reports the launched grid. N=512, pencil 1x2x4, 8 A100, NCCL 2.27.7, `--overlap standard`:
+  Boundary GPU time per step 55.9 -> 29.3 us (LBM D3Q19) and 44.3 -> 22.2 us (CG matvec);
+  LBM 57,067 -> 57,560 MLUPS (+0.9 %), CG 2.003 -> 1.986 ms/iter (-0.8 %), checksums and CG
+  residual bitwise unchanged.
+- **2026-11 — Packed halo gather/scatter fused per axis pass.** `HaloDistributed` used one
+  `gather_kernel` / `scatter_kernel` launch per face side (and per `kMaxPackComps` chunk).
+  Consecutive pack steps of a pass are now one `PackBatch` launch: `blockIdx.z` runs over every
+  (step, component) via a short prefix table (`detail/halo_pack_plan.h`, kernels in
+  `src/halo_pack.cu`). A typical two-sided Z pass is therefore one gather and one scatter.
+  Host coverage in `tests/test_halo_pack_plan.cpp`. Pencil 1x2x4 LBM interior rank: pack
+  launches per step 6 -> 4 (ncu gathers/dense = scatters/dense = 2.0).

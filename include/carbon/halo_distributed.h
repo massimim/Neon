@@ -489,7 +489,11 @@ private:
   build_multi_axis_() -> void;
 
 #if CARBON_BACKEND_IS_CUDALIKE
-  /** Launch every gather (or scatter) kernel of one pass on @p stream. */
+  /**
+   * Launch gather (or scatter) kernels of one pass on @p stream. Consecutive steps are fused into
+   * one @ref detail::halo_pack::PackBatch launch (up to @c kMaxPackBatchSteps at a time) so a
+   * typical two-sided axis pass is a single kernel.
+   */
   auto
   run_pack_steps_(const std::vector<detail::halo_pack::PackStep>& steps,
                   const Stream& stream,
@@ -501,18 +505,22 @@ private:
     const detail::gpu_stream_t native = stream.native_at(0);
     T* field_base = field_.gpu_buffers()[0].data();
     T* stage_base = stage_[0].data();
-    for (const detail::halo_pack::PackStep& step : steps) {
+    for (size_t i = 0; i < steps.size();) {
+      const size_t n =
+          std::min<size_t>(detail::halo_pack::kMaxPackBatchSteps, steps.size() - i);
+      const detail::halo_pack::PackBatch batch =
+          detail::halo_pack::make_pack_batch(steps.data() + i, n);
       const detail::gpu_error_t err =
-          gather
-              ? detail::halo_pack::launch_gather(gpu, native, sizeof(T), field_base,
-                                                 stage_base + step.stage_offset, step.args)
-              : detail::halo_pack::launch_scatter(
-                    gpu, native, sizeof(T), stage_base + step.stage_offset, field_base, step.args);
+          gather ? detail::halo_pack::launch_gather_batch(gpu, native, sizeof(T), field_base,
+                                                          stage_base, batch)
+                 : detail::halo_pack::launch_scatter_batch(gpu, native, sizeof(T), stage_base,
+                                                           field_base, batch);
       if (err != detail::gpu_success) {
         log::throw_with_log<std::runtime_error>(
             "HaloDistributed packed {} kernel launch failed: {}", gather ? "gather" : "scatter",
             detail::gpu_error_string(err));
       }
+      i += n;
     }
   }
 #endif

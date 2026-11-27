@@ -27,9 +27,10 @@
  *
  * This header is host-only and has no backend dependency, so the whole plan (extents, component
  * lists, peers, message ordering) and the per-thread index math are unit-testable with a plain
- * C++ compiler (see tests/test_halo_pack_plan.cpp). The CUDA/HIP kernels in src/halo_pack.cu are
- * thin wrappers that forward their launch coordinates to @ref pack_gather_thread /
- * @ref pack_scatter_thread, so the tested code IS the device code.
+ * C++ compiler (see tests/test_dense_distributed_host.cpp and tests/test_halo_pack_plan.cpp). The
+ * CUDA/HIP kernels in src/halo_pack.cu are thin wrappers that forward their launch coordinates to
+ * @ref pack_gather_thread / @ref pack_scatter_thread (and the fused @ref pack_gather_batch_thread /
+ * @ref pack_scatter_batch_thread), so the tested code IS the device code.
  *
  * Face extents (design: staged X -> Y -> Z)
  * -----------------------------------------
@@ -71,6 +72,12 @@ using halo_distributed_build::AxisSide;
 
 /** Maximum components packed by one kernel launch (kernel argument struct is fixed-size). */
 inline constexpr uint32_t kMaxPackComps = 32U;
+/**
+ * Maximum @c PackStep entries fused into one gather/scatter launch (@ref PackBatch).
+ * Two sides x ceil(Components / kMaxPackComps) fits for Components up to 128; larger plans
+ * are split into several batch launches by the caller.
+ */
+inline constexpr uint32_t kMaxPackBatchSteps = 8U;
 /** Threads per block along x for pack/unpack kernels. */
 inline constexpr uint32_t kPackBlockX = 256U;
 
@@ -132,6 +139,58 @@ pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
 }
 
 /**
+ * Several @c PackStep launches fused into one kernel: @c blockIdx.z runs over every packed
+ * component of every step (prefix in @ref z_prefix), matching the Pencil Boundary trick of
+ * folding face identity into the z grid dim so the host issues one gather and one scatter per
+ * axis pass.
+ *
+ * @c stage_offsets are element offsets into the caller's staging base pointer (the same values
+ * stored on @c PackStep::stage_offset). Within one axis pass the face boxes share extents, so
+ * idle threads from taking max(grid_x/grid_y) are rare.
+ */
+struct PackBatch {
+  PackKernelArgs steps[kMaxPackBatchSteps]{};
+  size_t stage_offsets[kMaxPackBatchSteps]{};
+  uint32_t z_prefix[kMaxPackBatchSteps + 1U]{};  ///< step s owns z in [z_prefix[s], z_prefix[s+1])
+  uint32_t num_steps{};
+  uint32_t total_z{};
+};
+
+/** Launch geometry for a fused batch: max x/y over steps, z = total packed components. */
+[[nodiscard]] inline auto
+pack_batch_launch_shape(const PackBatch& b) noexcept -> PackLaunchShape {
+  PackLaunchShape s;
+  s.block_x = kPackBlockX;
+  s.grid_x = 0U;
+  s.grid_y = 0U;
+  for (uint32_t i = 0; i < b.num_steps; ++i) {
+    const PackKernelArgs& a = b.steps[i];
+    s.grid_x = std::max(s.grid_x, (a.row + kPackBlockX - 1U) / kPackBlockX);
+    s.grid_y = std::max(s.grid_y, std::min<uint32_t>(a.ext_z, 65535U));
+  }
+  s.grid_z = b.total_z;
+  return s;
+}
+
+/** Map @p bz to (step index, local component index). Linear scan: @c num_steps is tiny. */
+[[nodiscard]] CARBON_HD inline auto
+pack_batch_decode(const PackBatch& b,
+                  uint32_t bz,
+                  uint32_t& step,
+                  uint32_t& local_bz) noexcept -> bool {
+  if (bz >= b.total_z || b.num_steps == 0U) {
+    return false;
+  }
+  uint32_t s = 0U;
+  while (s + 1U < b.num_steps && bz >= b.z_prefix[s + 1U]) {
+    ++s;
+  }
+  step = s;
+  local_bz = bz - b.z_prefix[s];
+  return true;
+}
+
+/**
  * One device thread of the gather kernel (field -> staging). Host+device so the same code runs
  * in the CUDA/HIP kernel and in the host unit test.
  */
@@ -190,6 +249,48 @@ pack_scatter_thread(const W* CARBON_PACK_RESTRICT stage,
   }
 }
 
+/** One device thread of a fused gather: @p bz selects (step, component) via @ref pack_batch_decode. */
+template <typename W>
+CARBON_HD inline void
+pack_gather_batch_thread(const W* CARBON_PACK_RESTRICT field,
+                         W* CARBON_PACK_RESTRICT stage_base,
+                         const PackBatch& b,
+                         uint32_t bx,
+                         uint32_t by,
+                         uint32_t bz,
+                         uint32_t tx,
+                         uint32_t bdx,
+                         uint32_t gdy) {
+  uint32_t step = 0U;
+  uint32_t local_bz = 0U;
+  if (!pack_batch_decode(b, bz, step, local_bz)) {
+    return;
+  }
+  pack_gather_thread<W>(field, stage_base + b.stage_offsets[step], b.steps[step], bx, by, local_bz,
+                        tx, bdx, gdy);
+}
+
+/** One device thread of a fused scatter. */
+template <typename W>
+CARBON_HD inline void
+pack_scatter_batch_thread(const W* CARBON_PACK_RESTRICT stage_base,
+                          W* CARBON_PACK_RESTRICT field,
+                          const PackBatch& b,
+                          uint32_t bx,
+                          uint32_t by,
+                          uint32_t bz,
+                          uint32_t tx,
+                          uint32_t bdx,
+                          uint32_t gdy) {
+  uint32_t step = 0U;
+  uint32_t local_bz = 0U;
+  if (!pack_batch_decode(b, bz, step, local_bz)) {
+    return;
+  }
+  pack_scatter_thread<W>(stage_base + b.stage_offsets[step], field, b.steps[step], bx, by, local_bz,
+                         tx, bdx, gdy);
+}
+
 /** Host reference of a full gather launch (used by tests and as executable documentation). */
 template <typename W>
 inline auto
@@ -226,6 +327,42 @@ host_scatter(const W* stage,
   }
 }
 
+/** Host reference of a fused gather launch. */
+template <typename W>
+inline auto
+host_gather_batch(const W* field,
+                  W* stage_base,
+                  const PackBatch& b) -> void {
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
+    for (uint32_t by = 0; by < s.grid_y; ++by) {
+      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
+        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+          pack_gather_batch_thread<W>(field, stage_base, b, bx, by, bz, tx, s.block_x, s.grid_y);
+        }
+      }
+    }
+  }
+}
+
+/** Host reference of a fused scatter launch. */
+template <typename W>
+inline auto
+host_scatter_batch(const W* stage_base,
+                   W* field,
+                   const PackBatch& b) -> void {
+  const PackLaunchShape s = pack_batch_launch_shape(b);
+  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
+    for (uint32_t by = 0; by < s.grid_y; ++by) {
+      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
+        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+          pack_scatter_batch_thread<W>(stage_base, field, b, bx, by, bz, tx, s.block_x, s.grid_y);
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Plan
 // ---------------------------------------------------------------------------
@@ -240,6 +377,33 @@ struct PackStep {
   PackKernelArgs args{};
   size_t stage_offset{};  ///< element offset into the HaloDistributed's staging buffer
 };
+
+/** Build a batch from @p steps (@p n in 1..kMaxPackBatchSteps). */
+[[nodiscard]] inline auto
+make_pack_batch(const PackStep* steps,
+                size_t n) -> PackBatch {
+  if (n == 0U || n > kMaxPackBatchSteps) {
+    throw std::invalid_argument("make_pack_batch: step count out of range");
+  }
+  PackBatch b;
+  b.num_steps = static_cast<uint32_t>(n);
+  b.z_prefix[0] = 0U;
+  for (size_t i = 0; i < n; ++i) {
+    b.steps[i] = steps[i].args;
+    b.stage_offsets[i] = steps[i].stage_offset;
+    if (b.steps[i].num_comps == 0U) {
+      throw std::invalid_argument("make_pack_batch: empty step");
+    }
+    b.z_prefix[i + 1U] = b.z_prefix[i] + b.steps[i].num_comps;
+  }
+  b.total_z = b.z_prefix[n];
+  return b;
+}
+
+[[nodiscard]] inline auto
+make_pack_batch(const std::vector<PackStep>& steps) -> PackBatch {
+  return make_pack_batch(steps.data(), steps.size());
+}
 
 /** One cross-rank message over a contiguous staging region. */
 struct PackMsg {
@@ -293,11 +457,11 @@ pack_face_box(const AxisGeometry& g,
   const bool lower = side == AxisSide::Lower;
   switch (axis) {
     case Axis::X:
-      return PackBox{lower ? g.halo.x : g.owned.x, g.halo.y, g.halo.z,
-                     g.halo.x,                     g.owned.y, g.owned.z};
+      return PackBox{
+          lower ? g.halo.x : g.owned.x, g.halo.y, g.halo.z, g.halo.x, g.owned.y, g.owned.z};
     case Axis::Y:
-      return PackBox{r.x_lo,        lower ? g.halo.y : g.owned.y, g.halo.z,
-                     r.x_hi - r.x_lo, g.halo.y,                   g.owned.z};
+      return PackBox{r.x_lo,   lower ? g.halo.y : g.owned.y, g.halo.z, r.x_hi - r.x_lo, g.halo.y,
+                     g.owned.z};
     case Axis::Z:
       return PackBox{r.x_lo,          r.y_lo,          lower ? g.halo.z : g.owned.z,
                      r.x_hi - r.x_lo, r.y_hi - r.y_lo, g.halo.z};
@@ -314,11 +478,11 @@ pack_halo_box(const AxisGeometry& g,
   const bool lower = side == AxisSide::Lower;
   switch (axis) {
     case Axis::X:
-      return PackBox{lower ? 0 : g.halo.x + g.owned.x, g.halo.y, g.halo.z,
-                     g.halo.x,                         g.owned.y, g.owned.z};
+      return PackBox{
+          lower ? 0 : g.halo.x + g.owned.x, g.halo.y, g.halo.z, g.halo.x, g.owned.y, g.owned.z};
     case Axis::Y:
-      return PackBox{r.x_lo,          lower ? 0 : g.halo.y + g.owned.y, g.halo.z,
-                     r.x_hi - r.x_lo, g.halo.y,                         g.owned.z};
+      return PackBox{
+          r.x_lo, lower ? 0 : g.halo.y + g.owned.y, g.halo.z, r.x_hi - r.x_lo, g.halo.y, g.owned.z};
     case Axis::Z:
       return PackBox{r.x_lo,          r.y_lo,          lower ? 0 : g.halo.z + g.owned.z,
                      r.x_hi - r.x_lo, r.y_hi - r.y_lo, g.halo.z};
@@ -432,17 +596,21 @@ build_axis_pack_plan(const ProcessGrid& pg,
   FilledRange fill{0, g.haloed.x, 0, g.haloed.y};
   if (axis != Axis::X && g.halo.x > 0) {
     const bool has_lo =
-        halo_distributed_build::axis_neighbour(pg, coords, Axis::X, boundary, AxisSide::Lower).present;
+        halo_distributed_build::axis_neighbour(pg, coords, Axis::X, boundary, AxisSide::Lower)
+            .present;
     const bool has_hi =
-        halo_distributed_build::axis_neighbour(pg, coords, Axis::X, boundary, AxisSide::Upper).present;
+        halo_distributed_build::axis_neighbour(pg, coords, Axis::X, boundary, AxisSide::Upper)
+            .present;
     fill.x_lo = has_lo ? 0 : g.halo.x;
     fill.x_hi = g.haloed.x - (has_hi ? 0 : g.halo.x);
   }
   if (axis == Axis::Z && g.halo.y > 0) {
     const bool has_lo =
-        halo_distributed_build::axis_neighbour(pg, coords, Axis::Y, boundary, AxisSide::Lower).present;
+        halo_distributed_build::axis_neighbour(pg, coords, Axis::Y, boundary, AxisSide::Lower)
+            .present;
     const bool has_hi =
-        halo_distributed_build::axis_neighbour(pg, coords, Axis::Y, boundary, AxisSide::Upper).present;
+        halo_distributed_build::axis_neighbour(pg, coords, Axis::Y, boundary, AxisSide::Upper)
+            .present;
     fill.y_lo = has_lo ? 0 : g.halo.y;
     fill.y_hi = g.haloed.y - (has_hi ? 0 : g.halo.y);
   }

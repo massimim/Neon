@@ -319,6 +319,8 @@ public:
    *             @c Span::iter_extent. Defaults to @c DataView::Standard.
    * @return Computed in the constructor from @c spans()[i].iter_extent(view),
    *         @c dense_make_kernel_block(), and each device's @c max_threads_per_block.
+   *         For @c Boundary on a Pencil span (with a @c z == 1 block) it is instead the grid
+   *         of the single four-face launch (see @c pencil_boundary_grid ).
    *         Returned as @ref LaunchShape so the public API does not depend on any
    *         backend-specific 3D type (the CUDA backend converts to @c dim3 internally;
    *         the future SYCL backend will convert to @c sycl::range<3>).

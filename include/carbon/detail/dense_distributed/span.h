@@ -418,6 +418,12 @@ public:
                       int64_3d{ex > 0 ? ex : 0, ey > 0 ? ey : 0, ez > 0 ? ez : 0}};
   }
 
+  /** Per-axis low / high Boundary band thickness and box volumes (see @ref ShellBands). */
+  [[nodiscard]] CARBON_HD constexpr auto
+  shell_bands() const noexcept -> ShellBands {
+    return make_shell_bands_(haloed_extent_, halo_);
+  }
+
   /**
    * Owned cells within @c halo() of an owned face, as up to six disjoint boxes (empty ones
    * omitted). Same partition as the compact shell decoded by @ref set_and_validate: Z-low, Z-high

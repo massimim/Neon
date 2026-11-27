@@ -1,6 +1,7 @@
 #include <carbon/dense_distributed.h>
 #include <carbon/detail/dense/launch_shape.h>
 #include <carbon/detail/dense_distributed/layout.h>
+#include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/distributed.h>
 #include <carbon/launch_shape.h>
 #include <carbon/logging.h>
@@ -209,9 +210,15 @@ DenseDistributed::init_common_(System system,
     });
     gpu_grid_per_view_[vi] = system_.make_vector([&](size_t i) {
       const detail::Gpu& gpu = system_.gpu_group().devices()[i];
+      const LaunchShape block = gpu_block_per_view_[vi][i];
       LaunchShape grid;
-      detail::compute_dense_grid(spans_[i].iter_extent(view), gpu_block_per_view_[vi][i],
+      detail::compute_dense_grid(spans_[i].iter_extent(view), block,
                                  gpu.properties().max_threads_per_block, grid);
+      if (view == DataView::Boundary &&
+          detail::dense_distributed::uses_pencil_boundary_launch(spans_[i], block)) {
+        grid = detail::dense_distributed::pencil_boundary_grid(
+            detail::dense_distributed::pencil_boundary_layout(spans_[i]), block);
+      }
       return grid;
     });
   }

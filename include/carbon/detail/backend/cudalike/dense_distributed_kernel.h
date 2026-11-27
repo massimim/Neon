@@ -6,6 +6,7 @@
  */
 
 #include <carbon/data_view.h>
+#include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/detail/dense_distributed/span.h>
 
 #include <concepts>
@@ -84,6 +85,27 @@ dense_grid_kernel(TypedSpan<Kind> span,
     return;
   }
   fn(local, Idx(o.x + ix, o.y + iy, o.z + iz));
+}
+
+/**
+ * Whole Boundary view of a Pencil span in one launch: @c blockIdx.z selects the face and layer,
+ * x / y are @c blockIdx * blockDim + threadIdx (see @c pencil_boundary.h for the mapping and
+ * @ref pencil_boundary_grid for the launch grid). Requires @c blockDim.z == 1. Kept separate from
+ * @ref dense_grid_kernel so the Standard / Internal path keeps its register footprint.
+ */
+template <typename F>
+requires dense_kernel_fn_for<F, TypedSpan<StorageKind::Pencil>> __global__ void
+dense_pencil_boundary_kernel(TypedSpan<StorageKind::Pencil> span,
+                             F fn) {
+  const TypedSpan<StorageKind::Pencil> local{span};
+  const PencilBoundaryLayout l = pencil_boundary_layout(local);
+  int64_3d c{};
+  if (!pencil_boundary_cell(l, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+                            blockDim.x, blockDim.y, c)) {
+    return;
+  }
+  const int64_3d h = local.halo();
+  fn(local, Idx(h.x + c.x, h.y + c.y, h.z + c.z));
 }
 
 #endif
