@@ -40,6 +40,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -220,11 +222,12 @@ skeleton_options_summary(const carbon::Skeleton::Options& opts,
   return out;
 }
 
+// On/off value of a boolean environment switch, or std::nullopt when unset or unrecognised.
 [[nodiscard]] auto
-ignore_region_masks_from_env() -> bool {
-  const char* raw = std::getenv("CARBON_IGNORE_REGION_MASKS");
+env_switch(const char* name) -> std::optional<bool> {
+  const char* raw = std::getenv(name);
   if (raw == nullptr) {
-    return false;
+    return std::nullopt;
   }
   std::string value(raw);
   for (char& c : value) {
@@ -233,11 +236,23 @@ ignore_region_masks_from_env() -> bool {
   if (value == "1" || value == "on" || value == "yes" || value == "true") {
     return true;
   }
-  if (!value.empty() && value != "0" && value != "off" && value != "no" && value != "false") {
-    CARBON_LOG_WARN("Skeleton: unrecognised CARBON_IGNORE_REGION_MASKS value \"{}\"; ignoring it",
-                    raw);
+  if (value == "0" || value == "off" || value == "no" || value == "false") {
+    return false;
   }
-  return false;
+  if (!value.empty()) {
+    CARBON_LOG_WARN("Skeleton: unrecognised {} value \"{}\"; ignoring it", name, raw);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] auto
+ignore_region_masks_from_env() -> bool {
+  return env_switch("CARBON_IGNORE_REGION_MASKS").value_or(false);
+}
+
+[[nodiscard]] auto
+expand_kernel_graphs_from_env() -> bool {
+  return env_switch("CARBON_EXPAND_KERNEL_GRAPHS").value_or(true);
 }
 
 }  // namespace
@@ -312,6 +327,65 @@ step_graph_data_preds(const std::vector<StepGraphNode>& nodes,
   return preds;
 }
 
+// Kahn order of the active nodes over data + hint edges, smallest ready id first; empty when the
+// graph has a cycle.
+auto
+step_graph_topo(const std::vector<StepGraphNode>& nodes) -> std::vector<size_t> {
+  std::vector<size_t> active_ids;
+  active_ids.reserve(nodes.size());
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (nodes[i].active) {
+      active_ids.push_back(i);
+    }
+  }
+
+  std::vector<size_t> indeg(nodes.size(), 0U);
+  for (size_t id : active_ids) {
+    for (size_t s : nodes[id].data_succs) {
+      if (nodes[s].active) {
+        ++indeg[s];
+      }
+    }
+    for (size_t s : nodes[id].hint_succs) {
+      if (nodes[s].active) {
+        ++indeg[s];
+      }
+    }
+  }
+
+  std::vector<size_t> topo;
+  topo.reserve(active_ids.size());
+  std::vector<size_t> ready;
+  for (size_t id : active_ids) {
+    if (indeg[id] == 0U) {
+      ready.push_back(id);
+    }
+  }
+  std::sort(ready.begin(), ready.end());
+  while (!ready.empty()) {
+    const size_t id = ready.front();
+    ready.erase(ready.begin());
+    topo.push_back(id);
+    auto relax = [&](const std::vector<size_t>& succs) {
+      for (size_t s : succs) {
+        if (!nodes[s].active) {
+          continue;
+        }
+        if (--indeg[s] == 0U) {
+          ready.push_back(s);
+        }
+      }
+    };
+    relax(nodes[id].data_succs);
+    relax(nodes[id].hint_succs);
+    std::sort(ready.begin(), ready.end());
+  }
+  if (topo.size() != active_ids.size()) {
+    return {};
+  }
+  return topo;
+}
+
 auto
 step_graph_replace_succ(std::vector<size_t>& succs,
                         size_t from,
@@ -349,6 +423,8 @@ Skeleton::compile() -> void {
   // every Stencil-read of a dirty field.
   compile_auto_insert_halos_();
   compile_auto_insert_scalar_readbacks_();
+  effective_parent_.assign(effective_kernels_.size(), kNoKernel_);
+  kernel_graphs_expanded_ = options_.expand_kernel_graphs && expand_kernel_graphs_from_env();
   rank_consistency_checked_ = false;
 
   copy_stream_idx_ = kNoStream_;
@@ -510,7 +586,11 @@ Skeleton::check_rank_consistency_() const -> void {
   mix(static_cast<std::uint64_t>(options_.overlap_mode));
   mix(options_.max_streams);
   mix(region_masks_honoured_ ? 1U : 0U);
+  mix(kernel_graphs_expanded_ ? 1U : 0U);
   mix(effective_kernels_.size());
+  for (size_t parent : effective_parent_) {
+    mix(parent);
+  }
   std::unordered_map<std::uint64_t, std::uint64_t> canonical_uid;
   for (const Kernel& k : effective_kernels_) {
     mix(static_cast<std::uint64_t>(k.kind()));
@@ -726,57 +806,14 @@ Skeleton::compile_step_graph_and_lower_(const std::vector<std::vector<size_t>>& 
   if (options_.overlap_mode != OverlapMode::None) {
     compile_step_graph_occ_(direct_preds_of, nodes);
   }
+  compile_expand_kernel_graphs_(nodes);
+  // Expansion appends the children to effective_kernels_.
+  const size_t n_kernels = effective_kernels_.size();
 
-  std::vector<size_t> active_ids;
-  active_ids.reserve(nodes.size());
-  for (size_t i = 0; i < nodes.size(); ++i) {
-    if (nodes[i].active) {
-      active_ids.push_back(i);
-    }
-  }
-
-  std::vector<size_t> indeg(nodes.size(), 0U);
-  for (size_t id : active_ids) {
-    for (size_t s : nodes[id].data_succs) {
-      if (nodes[s].active) {
-        ++indeg[s];
-      }
-    }
-    for (size_t s : nodes[id].hint_succs) {
-      if (nodes[s].active) {
-        ++indeg[s];
-      }
-    }
-  }
-
-  std::vector<size_t> topo;
-  topo.reserve(active_ids.size());
-  std::vector<size_t> ready;
-  for (size_t id : active_ids) {
-    if (indeg[id] == 0U) {
-      ready.push_back(id);
-    }
-  }
-  std::sort(ready.begin(), ready.end());
-  while (!ready.empty()) {
-    const size_t id = ready.front();
-    ready.erase(ready.begin());
-    topo.push_back(id);
-    auto relax = [&](const std::vector<size_t>& succs) {
-      for (size_t s : succs) {
-        if (!nodes[s].active) {
-          continue;
-        }
-        if (--indeg[s] == 0U) {
-          ready.push_back(s);
-        }
-      }
-    };
-    relax(nodes[id].data_succs);
-    relax(nodes[id].hint_succs);
-    std::sort(ready.begin(), ready.end());
-  }
-  if (topo.size() != active_ids.size()) {
+  const std::vector<size_t> topo = step_graph_topo(nodes);
+  if (topo.empty() && std::any_of(nodes.begin(), nodes.end(), [](const StepGraphNode& node) {
+        return node.active;
+      })) {
     log::throw_with_log<std::logic_error>(
         "Skeleton::compile_step_graph_and_lower_: step graph cycle detected");
   }
@@ -936,10 +973,11 @@ Skeleton::compile_step_graph_and_lower_(const std::vector<std::vector<size_t>>& 
 
   schedule_.clear();
   schedule_.reserve(topo.size());
-  kernel_stream_.assign(n, 0U);
-  record_event_per_kernel_.assign(n, kNoEvent_);
-  // A split kernel reports the stream of its first-issued half.
-  std::vector<bool> kernel_stream_set(n, false);
+  kernel_stream_.assign(n_kernels, 0U);
+  record_event_per_kernel_.assign(n_kernels, kNoEvent_);
+  // A split kernel reports the stream of its first-issued half, an expanded composite the stream
+  // of its first-issued child.
+  std::vector<bool> kernel_stream_set(n_kernels, false);
 
   for (size_t nid : topo) {
     Step step{};
@@ -950,9 +988,10 @@ Skeleton::compile_step_graph_and_lower_(const std::vector<std::vector<size_t>>& 
     step.wait_events = std::move(node_waits[nid]);
     step.record_event_idx = node_record_event[nid];
     schedule_.push_back(step);
-    if (!kernel_stream_set[step.kernel_idx]) {
-      kernel_stream_[step.kernel_idx] = step.stream_idx;
-      kernel_stream_set[step.kernel_idx] = true;
+    for (size_t k = step.kernel_idx; k != kNoKernel_ && !kernel_stream_set[k];
+         k = effective_parent_[k]) {
+      kernel_stream_[k] = step.stream_idx;
+      kernel_stream_set[k] = true;
     }
     if (step.record_event_idx != kNoEvent_) {
       record_event_per_kernel_[step.kernel_idx] = step.record_event_idx;
@@ -1834,6 +1873,238 @@ Skeleton::compile_allocate_anchor_events_() -> void {
     }
     events_.push_back(sys_.event());
     anchor_join_events_[s] = events_.size() - 1U;
+  }
+}
+
+auto
+Skeleton::compile_expand_kernel_graphs_(std::vector<StepGraphNode>& nodes) -> void {
+  if (!kernel_graphs_expanded_) {
+    return;
+  }
+  constexpr size_t kHead = detail::KernelGraph::kHead;
+  constexpr size_t kTail = detail::KernelGraph::kTail;
+  bool expanded_any = false;
+
+  // nodes grows while we walk it, so children that are composites are expanded in turn.
+  for (size_t nid = 0; nid < nodes.size(); ++nid) {
+    if (!nodes[nid].active) {
+      continue;
+    }
+    const size_t parent_k = nodes[nid].kernel_idx;
+    // A copy: effective_kernels_ grows below.
+    const std::shared_ptr<detail::KernelImpl> parent_impl = effective_kernels_[parent_k].impl();
+    std::optional<detail::KernelGraph> graph = parent_impl->expand(parent_impl);
+    if (!graph.has_value()) {
+      continue;
+    }
+    if (nodes[nid].view != DataView::Standard ||
+        nodes[nid].reduce_mode != reduce::ReduceLaunchMode::Full) {
+      CARBON_LOG_INFO(
+          "Skeleton::compile: kernel '{}' is split by the overlap rewrite; its kernel graph is "
+          "not expanded",
+          std::string{parent_impl->name()});
+      continue;
+    }
+
+    const std::string parent_name{parent_impl->name()};
+    const size_t m = graph->nodes.size();
+    const size_t total = m + 2U;
+    std::vector<std::vector<size_t>> succ(total);
+    std::vector<size_t> indeg(total, 0U);
+    auto add_edge = [&](size_t from, size_t to) {
+      if (std::find(succ[from].begin(), succ[from].end(), to) == succ[from].end()) {
+        succ[from].push_back(to);
+        ++indeg[to];
+      }
+    };
+    for (const auto& [from, to] : graph->edges) {
+      if (from >= total || to >= total || from == kTail || to == kHead || from == to) {
+        log::throw_with_log<std::logic_error>(
+            "Skeleton::compile: kernel graph of '{}' has an invalid edge {} -> {} ({} children)",
+            parent_name, from, to, m);
+      }
+      add_edge(from, to);
+    }
+    // A child with no predecessor hangs off the head, one with no successor feeds the tail, so
+    // every child is ordered against everything the composite is ordered against.
+    for (size_t c = 2U; c < total; ++c) {
+      if (indeg[c] == 0U) {
+        add_edge(kHead, c);
+      }
+      if (succ[c].empty()) {
+        add_edge(c, kTail);
+      }
+    }
+    if (succ[kHead].empty()) {
+      add_edge(kHead, kTail);
+    }
+    {
+      std::vector<size_t> deg = indeg;
+      std::vector<size_t> ready{kHead};
+      size_t visited = 0U;
+      while (!ready.empty()) {
+        const size_t v = ready.back();
+        ready.pop_back();
+        ++visited;
+        for (size_t s : succ[v]) {
+          if (--deg[s] == 0U) {
+            ready.push_back(s);
+          }
+        }
+      }
+      if (visited != total) {
+        log::throw_with_log<std::logic_error>("Skeleton::compile: kernel graph of '{}' has a cycle",
+                                              parent_name);
+      }
+    }
+
+    const auto& parent_tokens = parent_impl->tokens();
+    std::vector<size_t> id_to_nid(total, kNoKernel_);
+    for (size_t i = 0; i < m; ++i) {
+      const std::shared_ptr<detail::KernelImpl>& child = graph->nodes[i];
+      if (child == nullptr) {
+        log::throw_with_log<std::logic_error>(
+            "Skeleton::compile: kernel graph of '{}' has a null child", parent_name);
+      }
+      // The conflict DAG was built from the composite's tokens, so a child may only touch what
+      // they cover: same field, a write only under a write, a mask inside the composite's.
+      for (const AccessToken& t : child->tokens()) {
+        const bool covered =
+            std::any_of(parent_tokens.begin(), parent_tokens.end(), [&](const AccessToken& p) {
+              return p.field_uid == t.field_uid &&
+                     (t.mode == AccessMode::Read || p.mode != AccessMode::Read) &&
+                     (p.mask | t.mask) == p.mask;
+            });
+        if (!covered) {
+          log::throw_with_log<std::logic_error>(
+              "Skeleton::compile: child '{}' of kernel '{}' accesses field '{}' (uid={}) beyond "
+              "the composite's tokens",
+              std::string{child->name()}, parent_name,
+              t.field_name.empty() ? std::string{"<anonymous>"} : t.field_name, t.field_uid);
+        }
+      }
+      effective_kernels_.push_back(Kernel::from_impl(child));
+      effective_to_user_.push_back(kNoKernel_);
+      effective_parent_.push_back(parent_k);
+      StepGraphNode child_node{};
+      child_node.kernel_idx = effective_kernels_.size() - 1U;
+      nodes.push_back(std::move(child_node));
+      id_to_nid[i + 2U] = nodes.size() - 1U;
+    }
+
+    std::vector<size_t> entries;
+    std::vector<size_t> exits;
+    for (size_t s : succ[kHead]) {
+      if (s != kTail) {
+        entries.push_back(id_to_nid[s]);
+      }
+    }
+    for (size_t c = 2U; c < total; ++c) {
+      for (size_t s : succ[c]) {
+        if (s == kTail) {
+          exits.push_back(id_to_nid[c]);
+        } else {
+          step_graph_add_succ(nodes[id_to_nid[c]].data_succs, id_to_nid[s]);
+        }
+      }
+    }
+    const bool head_to_tail =
+        std::find(succ[kHead].begin(), succ[kHead].end(), kTail) != succ[kHead].end();
+
+    const std::vector<size_t> out_data = nodes[nid].data_succs;
+    const std::vector<size_t> out_hint = nodes[nid].hint_succs;
+    for (size_t p : step_graph_data_preds(nodes, nid)) {
+      step_graph_erase_succ(nodes[p].data_succs, nid);
+      for (size_t e : entries) {
+        step_graph_add_succ(nodes[p].data_succs, e);
+      }
+      if (head_to_tail) {
+        for (size_t s : out_data) {
+          step_graph_add_succ(nodes[p].data_succs, s);
+        }
+        for (size_t s : out_hint) {
+          step_graph_add_succ(nodes[p].hint_succs, s);
+        }
+      }
+    }
+    for (size_t p : step_graph_hint_preds(nodes, nid)) {
+      step_graph_erase_succ(nodes[p].hint_succs, nid);
+      for (size_t e : entries) {
+        step_graph_add_succ(nodes[p].hint_succs, e);
+      }
+      if (head_to_tail) {
+        for (size_t s : out_data) {
+          step_graph_add_succ(nodes[p].hint_succs, s);
+        }
+      }
+    }
+    for (size_t x : exits) {
+      for (size_t s : out_data) {
+        step_graph_add_succ(nodes[x].data_succs, s);
+      }
+      for (size_t s : out_hint) {
+        step_graph_add_succ(nodes[x].hint_succs, s);
+      }
+    }
+    nodes[nid].active = false;
+    nodes[nid].data_succs.clear();
+    nodes[nid].hint_succs.clear();
+
+    // Kernel-level edges for edges() / min_edges() and the kernel-list DOT. The composite keeps
+    // its own rows; its children get the spliced ones.
+    const size_t n_kernels = effective_kernels_.size();
+    edges_.resize(n_kernels);
+    min_edges_.resize(n_kernels);
+    auto add_kernel_edge = [&](size_t from_nid, size_t to_nid) {
+      const size_t from = nodes[from_nid].kernel_idx;
+      const size_t to = nodes[to_nid].kernel_idx;
+      step_graph_add_succ(edges_[from], to);
+      step_graph_add_succ(min_edges_[from], to);
+    };
+    for (size_t c = 2U; c < total; ++c) {
+      for (size_t s : succ[c]) {
+        if (s != kTail) {
+          add_kernel_edge(id_to_nid[c], id_to_nid[s]);
+        }
+      }
+    }
+    for (size_t k = 0; k < min_edges_.size(); ++k) {
+      if (std::find(min_edges_[k].begin(), min_edges_[k].end(), parent_k) != min_edges_[k].end()) {
+        for (size_t e : entries) {
+          step_graph_add_succ(edges_[k], nodes[e].kernel_idx);
+          step_graph_add_succ(min_edges_[k], nodes[e].kernel_idx);
+        }
+      }
+    }
+    for (size_t x : exits) {
+      for (size_t s : min_edges_[parent_k]) {
+        step_graph_add_succ(edges_[nodes[x].kernel_idx], s);
+        step_graph_add_succ(min_edges_[nodes[x].kernel_idx], s);
+      }
+    }
+    expanded_any = true;
+  }
+
+  if (!expanded_any) {
+    return;
+  }
+  // Children placed freely on streams could issue their NCCL operations in a different order on
+  // different ranks; a data edge between consecutive communicating children fixes one order.
+  const std::vector<size_t> topo = step_graph_topo(nodes);
+  if (topo.empty()) {
+    log::throw_with_log<std::logic_error>(
+        "Skeleton::compile: step graph cycle after kernel graph expansion");
+  }
+  size_t prev = kNoKernel_;
+  for (size_t nid : topo) {
+    const size_t k = nodes[nid].kernel_idx;
+    if (effective_parent_[k] == kNoKernel_ || !effective_kernels_[k].impl()->communicates()) {
+      continue;
+    }
+    if (prev != kNoKernel_) {
+      step_graph_add_succ(nodes[prev].data_succs, nid);
+    }
+    prev = nid;
   }
 }
 
@@ -2869,7 +3140,7 @@ Skeleton::halo_messages() -> std::vector<HaloMessages> {
       continue;
     }
     const Kernel& kernel = effective_kernels_[schedule_[op.step_idx].kernel_idx];
-    if (kernel.kind() != KernelKind::Halo) {
+    if (!kernel.impl()->communicates()) {
       continue;
     }
     out.push_back(HaloMessages{op.seq, step_display_label_(op.step_idx), kernel.dist_messages()});

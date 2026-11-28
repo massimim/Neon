@@ -248,6 +248,14 @@ public:
      * @c CARBON_IGNORE_REGION_MASKS=1 .
      */
     bool ignore_region_masks{false};
+    /**
+     * Replace every kernel that describes itself as a graph of child kernels (e.g. a
+     * @c HaloDistributed on the packed path: gather, exchange and scatter per axis pass) by its
+     * children after dependency analysis and the overlap rewrite, so each child is its own step
+     * with its own stream and events. @c false keeps every such kernel as one step. Also forced
+     * off by the environment variable @c CARBON_EXPAND_KERNEL_GRAPHS=0 .
+     */
+    bool expand_kernel_graphs{true};
 
     constexpr Options() noexcept
         : overlap_mode(OverlapMode::None),
@@ -516,6 +524,7 @@ public:
     kernels_.clear();
     effective_kernels_.clear();
     effective_to_user_.clear();
+    effective_parent_.clear();
     edges_.clear();
     min_edges_.clear();
     schedule_.clear();
@@ -677,11 +686,22 @@ public:
 
   /**
    * @brief Maps each effective-kernel index back to the user's kernel index,
-   *        or @c kNoKernel for auto-inserted halos.
+   *        or @c kNoKernel for auto-inserted halos and for the children of expanded kernel
+   *        graphs.
    */
   [[nodiscard]] auto
   effective_to_user() const noexcept -> const std::vector<size_t>& {
     return effective_to_user_;
+  }
+
+  /**
+   * @brief For each effective kernel, the effective index of the composite it was expanded from
+   *        (see @c Options::expand_kernel_graphs ), or @c kNoKernel . An expanded composite stays
+   *        in @ref effective_kernels but has no step in the schedule.
+   */
+  [[nodiscard]] auto
+  effective_parent() const noexcept -> const std::vector<size_t>& {
+    return effective_parent_;
   }
 
   /** The kernel list, in user-add order. Stable across @ref compile / @ref run . */
@@ -1184,6 +1204,24 @@ private:
                           std::vector<detail::StepGraphNode>& nodes) -> void;
 
   /**
+   * @brief Replace every active step-graph node whose kernel returns a
+   *        @c detail::KernelGraph (@c KernelImpl::expand ) by the graph's children.
+   *
+   * Runs after @ref compile_step_graph_occ_ , so dependency analysis and the overlap rewrite see
+   * the composite as one node. Children are appended to @ref effective_kernels_ ; the composite's
+   * data and hint predecessors feed the children after the graph's head, the children before
+   * its tail feed the composite's successors. Children that are composites themselves are
+   * expanded too. Every communicating child (@c KernelImpl::communicates ) is chained after the
+   * previous one in issue order, so NCCL operations keep one order on every rank whatever
+   * streams the children land on. Also extends @ref edges_ / @ref min_edges_ with the children.
+   *
+   * @throws std::logic_error when a graph has a cycle or an edge to an unknown node, or when a
+   *         child accesses a field the composite's tokens do not cover.
+   */
+  auto
+  compile_expand_kernel_graphs_(std::vector<detail::StepGraphNode>& nodes) -> void;
+
+  /**
    * @brief OCC rewrite phase 1: collect every (halo, stencil) candidate
    *        pair where @p halo is a direct predecessor of @p stencil in
    *        @ref min_edges_ , @p halo is @c KernelKind::Halo , @p stencil
@@ -1283,6 +1321,10 @@ private:
   // kNoKernel_ when the entry is an auto-inserted halo. Exposed via
   // @ref effective_kernels and @ref effective_to_user .
   std::vector<size_t> effective_to_user_{};
+  // Composite each effective kernel was expanded from, or kNoKernel_ (see effective_parent()).
+  std::vector<size_t> effective_parent_{};
+  // Options::expand_kernel_graphs combined with CARBON_EXPAND_KERNEL_GRAPHS, set by compile().
+  bool kernel_graphs_expanded_{true};
   std::vector<std::vector<size_t>> edges_{};
   std::vector<std::vector<size_t>> min_edges_{};
   std::vector<Step> schedule_{};

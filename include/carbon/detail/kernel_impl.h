@@ -18,6 +18,9 @@
 #include <carbon/reduce.h>
 #include <carbon/system.h>
 
+#include <cstddef>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -86,6 +89,39 @@ enum class KernelKind : int {
 };
 
 namespace detail {
+
+class KernelImpl;
+
+/**
+ * Child kernels of a composite kernel (@ref KernelImpl::expand ) and the order between them.
+ *
+ * Node ids: @ref kHead and @ref kTail are the dummy start and end, child @c i (as returned by
+ * @ref add ) has id @c 2 + i . When the @c Skeleton expands a composite, the composite's
+ * predecessors connect to the successors of @c kHead and the predecessors of @c kTail connect to
+ * the composite's successors; a child with no predecessor hangs off @c kHead and a child with no
+ * successor feeds @c kTail .
+ */
+struct KernelGraph {
+  static constexpr size_t kHead = 0U;
+  static constexpr size_t kTail = 1U;
+
+  std::vector<std::shared_ptr<KernelImpl>> nodes{};
+  std::vector<std::pair<size_t, size_t>> edges{};
+
+  /** Append a child; returns its node id. */
+  auto
+  add(std::shared_ptr<KernelImpl> kernel) -> size_t {
+    nodes.push_back(std::move(kernel));
+    return nodes.size() + 1U;
+  }
+
+  /** Order @p from before @p to (node ids, including @ref kHead / @ref kTail ). */
+  auto
+  edge(size_t from,
+       size_t to) -> void {
+    edges.emplace_back(from, to);
+  }
+};
 
 /**
  * Abstract base behind ::carbon::Kernel. Every concrete kernel kind (compute, reduction,
@@ -240,6 +276,30 @@ public:
   [[nodiscard]] virtual auto
   dist_messages() const -> std::vector<DistMessage> {
     return {};
+  }
+
+  /**
+   * @brief Whether a launch of this kernel issues cross-rank communication. Drives
+   *        @c Skeleton::halo_messages and the communication order of expanded kernel graphs.
+   *        Default: every halo.
+   */
+  [[nodiscard]] virtual auto
+  communicates() const noexcept -> bool {
+    return kind() == KernelKind::Halo;
+  }
+
+  /**
+   * @brief Describe this kernel as a graph of child kernels, or @c std::nullopt to stay one node.
+   *
+   * The @c Skeleton runs dependency analysis and the overlap rewrite on the composite (its
+   * @ref tokens must cover every access of its children), then replaces it by the children (see
+   * @ref KernelGraph ). The children run instead of @ref launch . @p self is the @c shared_ptr
+   * owning this impl, so children can keep it alive. The graph must have the same shape on
+   * every rank.
+   */
+  [[nodiscard]] virtual auto
+  expand(const std::shared_ptr<KernelImpl>& /*self*/) const -> std::optional<KernelGraph> {
+    return std::nullopt;
   }
 
   /** Optional human-readable name; empty by default. */

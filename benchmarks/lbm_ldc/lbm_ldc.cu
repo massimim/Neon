@@ -152,6 +152,9 @@ struct Options {
   // NCCL / scatter kernels and the Boundary half inherit it, so they get SMs ahead of
   // the Internal half's pending blocks. Only meaningful with --overlap != none.
   bool hp_halo = false;
+  // carbon::HaloExchangeMode for --grid dense_distributed: "staged" (default, X -> Y -> Z passes)
+  // or "direct" (Pencil only: one gather / NCCL group / scatter with diagonal peers).
+  std::string halo_exchange = "staged";
   std::string export_dot_path = "";
   std::string export_dot_png_path = "";
   std::string export_dot_streams_path = "";
@@ -238,6 +241,10 @@ build_cli(Options& opts) -> clipp::group {
           "Options::halo_stream_priority = High) so the halo gather / NCCL / scatter and "
           "Boundary kernels get SMs before Internal's pending blocks. Only meaningful with "
           "--overlap != none.",
+      (option("--halo-exchange") & value("staged|direct", opts.halo_exchange)) %
+          "Halo exchange of --grid dense_distributed (default 'staged'). 'direct' exchanges "
+          "faces and YZ edges with all eight neighbours in one packed pass on pencil spans; "
+          "other decompositions keep the staged passes.",
       (option("--export-dot") & value("path", opts.export_dot_path)) %
           "Write the compiled Skeleton launch-matrix schedule (GraphViz .dot) for "
           "the AB ping-pong skeleton to PATH after compile.",
@@ -338,6 +345,11 @@ parse_cli(int argc,
     std::cerr << "lbm_ldc: --overlap must be one of "
                  "{none, standard, extended, twoway-extended} (got '"
               << opts.overlap << "')\n";
+    return false;
+  }
+  if (opts.halo_exchange != "staged" && opts.halo_exchange != "direct") {
+    std::cerr << "lbm_ldc: --halo-exchange must be staged or direct (got '" << opts.halo_exchange
+              << "')\n";
     return false;
   }
   return true;
@@ -598,7 +610,12 @@ run_benchmark(const Options& opts,
     } else if constexpr (std::is_same_v<Grid, carbon::DenseDisgDistributed>) {
       return carbon::DenseDisgDistributed(sys, global, *pg, stencil);
     } else {
-      return carbon::DenseDistributed(sys, global, *pg, stencil);
+      const carbon::HaloExchangeMode halo_exchange = opts.halo_exchange == "direct"
+                                                         ? carbon::HaloExchangeMode::Direct
+                                                         : carbon::HaloExchangeMode::Staged;
+      return carbon::DenseDistributed(sys, global, *pg, stencil,
+                                      carbon::BoundaryModeDistributed::Open, carbon::float32_3d{},
+                                      1.0F, std::nullopt, halo_exchange);
     }
   }();
 
@@ -614,10 +631,10 @@ run_benchmark(const Options& opts,
     CARBON_LOG_INFO(
         "lbm_ldc: lattice={} collision={} precision={} grid={} N={} iters={} "
         "warmup={} Re={:.3g} ulb={:.4g} omega={:.4g} GPUs={} local_gpus={} ranks={} "
-        "decomposition={} Q={}",
+        "decomposition={} Q={} halo_exchange={}",
         lattice_name, collision_name, opts.precision, opts.grid, opts.n, opts.iters, opts.warmup,
         opts.re, ulb, omega, total_gpu_count, local_gpu_count, world_size,
-        decomposition_mode_name(dec_mode), Lattice::Q);
+        decomposition_mode_name(dec_mode), Lattice::Q, opts.halo_exchange);
   }
 
   // Two ping-pong populations + a cell-type field. HostDevice so we can
@@ -1097,6 +1114,7 @@ run_benchmark(const Options& opts,
     out << "    \"precision\": \"" << json_escape(opts.precision) << "\",\n";
     out << "    \"grid\": \"" << json_escape(opts.grid) << "\",\n";
     out << "    \"decomposition\": \"" << decomposition_mode_name(dec_mode) << "\",\n";
+    out << "    \"halo_exchange\": \"" << json_escape(opts.halo_exchange) << "\",\n";
     if (pg) {
       const carbon::int32_3d dims = pg->dims();
       out << "    \"process_grid\": [" << dims.x << ", " << dims.y << ", " << dims.z << "],\n";

@@ -29,8 +29,8 @@
  * lists, peers, message ordering) and the per-thread index math are unit-testable with a plain
  * C++ compiler (see tests/test_dense_distributed_host.cpp and tests/test_halo_pack_plan.cpp). The
  * CUDA/HIP kernels in src/halo_pack.cu are thin wrappers that forward their launch coordinates to
- * @ref pack_gather_thread / @ref pack_scatter_thread (and the fused @ref pack_gather_batch_thread /
- * @ref pack_scatter_batch_thread), so the tested code IS the device code.
+ * @ref pack_gather_thread / @ref pack_scatter_thread (and the fused @ref pack_gather_table_thread /
+ * @ref pack_scatter_table_thread), so the tested code IS the device code.
  *
  * Face extents (design: staged X -> Y -> Z)
  * -----------------------------------------
@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -70,14 +71,8 @@ namespace carbon::detail::halo_pack {
 using halo_distributed_build::AxisGeometry;
 using halo_distributed_build::AxisSide;
 
-/** Maximum components packed by one kernel launch (kernel argument struct is fixed-size). */
+/** Maximum components packed by one @ref PackStep (its argument struct is fixed-size). */
 inline constexpr uint32_t kMaxPackComps = 32U;
-/**
- * Maximum @c PackStep entries fused into one gather/scatter launch (@ref PackBatch).
- * Two sides x ceil(Components / kMaxPackComps) fits for Components up to 128; larger plans
- * are split into several batch launches by the caller.
- */
-inline constexpr uint32_t kMaxPackBatchSteps = 8U;
 /** Threads per block along x for pack/unpack kernels. */
 inline constexpr uint32_t kPackBlockX = 256U;
 
@@ -139,54 +134,111 @@ pack_launch_shape(const PackKernelArgs& a) noexcept -> PackLaunchShape {
 }
 
 /**
- * Several @c PackStep launches fused into one kernel: @c blockIdx.z runs over every packed
- * component of every step (prefix in @ref z_prefix), matching the Pencil Boundary trick of
- * folding face identity into the z grid dim so the host issues one gather and one scatter per
- * axis pass.
+ * Several @c PackStep launches fused into one kernel. Step @c s owns the contiguous block range
+ * @c [block_prefix[s], block_prefix[s+1]) of a 1D grid, laid out as its own single-step grid
+ * (@ref pack_launch_shape) flattened component-major: component, then z stride, then row block.
+ * Each step keeps its own grid shape, so steps of very different shapes (Direct mixes faces that
+ * are wide in the row with faces that are long in z) share a launch without idle blocks.
+ *
+ * The arrays are not part of the struct: a kernel gets this view (a few pointers and counts) by
+ * value and reads the steps from device memory, so one launch covers any number of steps.
+ * @ref PackTableImage builds the arrays as one byte image, which HaloDistributed uploads once at
+ * construction (host tests view the image in place).
  *
  * @c stage_offsets are element offsets into the caller's staging base pointer (the same values
- * stored on @c PackStep::stage_offset). Within one axis pass the face boxes share extents, so
- * idle threads from taking max(grid_x/grid_y) are rare.
+ * stored on @c PackStep::stage_offset).
  */
-struct PackBatch {
-  PackKernelArgs steps[kMaxPackBatchSteps]{};
-  size_t stage_offsets[kMaxPackBatchSteps]{};
-  uint32_t z_prefix[kMaxPackBatchSteps + 1U]{};  ///< step s owns z in [z_prefix[s], z_prefix[s+1])
+struct PackTable {
+  const PackKernelArgs* steps{};
+  const size_t* stage_offsets{};
+  const uint32_t* grid_x{};        ///< row blocks of step s
+  const uint32_t* grid_y{};        ///< z grid-stride of step s
+  const uint32_t* block_prefix{};  ///< num_steps + 1 entries
   uint32_t num_steps{};
-  uint32_t total_z{};
+  uint32_t total_blocks{};
 };
 
-/** Launch geometry for a fused batch: max x/y over steps, z = total packed components. */
+/** Launch geometry for a fused table: one 1D grid covering every step's blocks. */
 [[nodiscard]] inline auto
-pack_batch_launch_shape(const PackBatch& b) noexcept -> PackLaunchShape {
+pack_table_launch_shape(const PackTable& t) noexcept -> PackLaunchShape {
   PackLaunchShape s;
   s.block_x = kPackBlockX;
-  s.grid_x = 0U;
-  s.grid_y = 0U;
-  for (uint32_t i = 0; i < b.num_steps; ++i) {
-    const PackKernelArgs& a = b.steps[i];
-    s.grid_x = std::max(s.grid_x, (a.row + kPackBlockX - 1U) / kPackBlockX);
-    s.grid_y = std::max(s.grid_y, std::min<uint32_t>(a.ext_z, 65535U));
-  }
-  s.grid_z = b.total_z;
+  s.grid_x = t.total_blocks;
+  s.grid_y = 1U;
+  s.grid_z = 1U;
   return s;
 }
 
-/** Map @p bz to (step index, local component index). Linear scan: @c num_steps is tiny. */
+/** Steps of @c block_prefix tested together by @ref pack_prefix_count (one per warp lane). */
+inline constexpr uint32_t kPackPrefixChunk = 32U;
+
+/**
+ * Number of steps @c s in <tt>[base, base + kPackPrefixChunk)</tt> with
+ * <tt>block_prefix[s] <= block</tt>. On CUDA devices each lane of the (full) warp reads one entry
+ * and the warp counts with a ballot, so the search is one load instead of a chain of dependent
+ * ones; elsewhere one thread reads the chunk (independent loads, same result). Every lane of a warp
+ * must call it with the same @p base and @p block.
+ */
 [[nodiscard]] CARBON_HD inline auto
-pack_batch_decode(const PackBatch& b,
-                  uint32_t bz,
+pack_prefix_count(const PackTable& t,
+                  uint32_t base,
+                  uint32_t block,
+                  uint32_t lane) noexcept -> uint32_t {
+#if defined(__CUDA_ARCH__)
+  const uint32_t s = base + lane;
+  const bool le = s < t.num_steps && t.block_prefix[s] <= block;
+  return static_cast<uint32_t>(__popc(__ballot_sync(0xFFFFFFFFU, le)));
+#else
+  (void)lane;
+  const uint32_t end =
+      t.num_steps - base < kPackPrefixChunk ? t.num_steps : base + kPackPrefixChunk;
+  uint32_t n = 0U;
+  for (uint32_t s = base; s < end; ++s) {
+    n += t.block_prefix[s] <= block ? 1U : 0U;
+  }
+  return n;
+#endif
+}
+
+/**
+ * Map the 1D block index @p block to its step and to that step's own (@p bx, @p by, @p bz)
+ * block coordinates. Block-uniform: the step is the number of @c block_prefix entries at or below
+ * @p block, minus one (@c block_prefix is strictly increasing, since every step has at least one
+ * block), counted @ref kPackPrefixChunk at a time (a one-step table skips the search, which would
+ * otherwise cost it a dependent load); then two divisions. @p lane is the caller's lane
+ * in its warp (see @ref pack_prefix_count); call before any thread of the warp exits.
+ */
+[[nodiscard]] CARBON_HD inline auto
+pack_table_decode(const PackTable& t,
+                  uint32_t block,
+                  uint32_t lane,
                   uint32_t& step,
-                  uint32_t& local_bz) noexcept -> bool {
-  if (bz >= b.total_z || b.num_steps == 0U) {
+                  uint32_t& bx,
+                  uint32_t& by,
+                  uint32_t& bz) noexcept -> bool {
+  if (block >= t.total_blocks || t.num_steps == 0U) {
     return false;
   }
   uint32_t s = 0U;
-  while (s + 1U < b.num_steps && bz >= b.z_prefix[s + 1U]) {
-    ++s;
+  if (t.num_steps > 1U) {
+    uint32_t count = 0U;
+    for (uint32_t base = 0U; base < t.num_steps; base += kPackPrefixChunk) {
+      const uint32_t n = pack_prefix_count(t, base, block, lane);
+      count += n;
+      if (n < kPackPrefixChunk) {
+        break;
+      }
+    }
+    s = count - 1U;
   }
+  const uint32_t local = block - t.block_prefix[s];
+  const uint32_t gx = t.grid_x[s];
+  const uint32_t per_comp = gx * t.grid_y[s];
+  bz = local / per_comp;
+  const uint32_t rem = local - bz * per_comp;
+  by = rem / gx;
+  bx = rem - by * gx;
   step = s;
-  local_bz = bz - b.z_prefix[s];
   return true;
 }
 
@@ -249,46 +301,47 @@ pack_scatter_thread(const W* CARBON_PACK_RESTRICT stage,
   }
 }
 
-/** One device thread of a fused gather: @p bz selects (step, component) via @ref pack_batch_decode. */
+/**
+ * One device thread of a fused gather: @p block selects the step via @ref pack_table_decode.
+ * @p bdx must be a multiple of the warp size (every lane takes part in the step search).
+ */
 template <typename W>
 CARBON_HD inline void
-pack_gather_batch_thread(const W* CARBON_PACK_RESTRICT field,
+pack_gather_table_thread(const W* CARBON_PACK_RESTRICT field,
                          W* CARBON_PACK_RESTRICT stage_base,
-                         const PackBatch& b,
-                         uint32_t bx,
-                         uint32_t by,
-                         uint32_t bz,
+                         const PackTable& t,
+                         uint32_t block,
                          uint32_t tx,
-                         uint32_t bdx,
-                         uint32_t gdy) {
+                         uint32_t bdx) {
   uint32_t step = 0U;
-  uint32_t local_bz = 0U;
-  if (!pack_batch_decode(b, bz, step, local_bz)) {
+  uint32_t bx = 0U;
+  uint32_t by = 0U;
+  uint32_t bz = 0U;
+  if (!pack_table_decode(t, block, tx % kPackPrefixChunk, step, bx, by, bz)) {
     return;
   }
-  pack_gather_thread<W>(field, stage_base + b.stage_offsets[step], b.steps[step], bx, by, local_bz,
-                        tx, bdx, gdy);
+  pack_gather_thread<W>(field, stage_base + t.stage_offsets[step], t.steps[step], bx, by, bz, tx,
+                        bdx, t.grid_y[step]);
 }
 
 /** One device thread of a fused scatter. */
 template <typename W>
 CARBON_HD inline void
-pack_scatter_batch_thread(const W* CARBON_PACK_RESTRICT stage_base,
+pack_scatter_table_thread(const W* CARBON_PACK_RESTRICT stage_base,
                           W* CARBON_PACK_RESTRICT field,
-                          const PackBatch& b,
-                          uint32_t bx,
-                          uint32_t by,
-                          uint32_t bz,
+                          const PackTable& t,
+                          uint32_t block,
                           uint32_t tx,
-                          uint32_t bdx,
-                          uint32_t gdy) {
+                          uint32_t bdx) {
   uint32_t step = 0U;
-  uint32_t local_bz = 0U;
-  if (!pack_batch_decode(b, bz, step, local_bz)) {
+  uint32_t bx = 0U;
+  uint32_t by = 0U;
+  uint32_t bz = 0U;
+  if (!pack_table_decode(t, block, tx % kPackPrefixChunk, step, bx, by, bz)) {
     return;
   }
-  pack_scatter_thread<W>(stage_base + b.stage_offsets[step], field, b.steps[step], bx, by, local_bz,
-                         tx, bdx, gdy);
+  pack_scatter_thread<W>(stage_base + t.stage_offsets[step], field, t.steps[step], bx, by, bz, tx,
+                         bdx, t.grid_y[step]);
 }
 
 /** Host reference of a full gather launch (used by tests and as executable documentation). */
@@ -327,38 +380,30 @@ host_scatter(const W* stage,
   }
 }
 
-/** Host reference of a fused gather launch. */
+/** Host reference of a fused gather launch (@p t viewing host memory). */
 template <typename W>
 inline auto
-host_gather_batch(const W* field,
+host_gather_table(const W* field,
                   W* stage_base,
-                  const PackBatch& b) -> void {
-  const PackLaunchShape s = pack_batch_launch_shape(b);
-  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
-    for (uint32_t by = 0; by < s.grid_y; ++by) {
-      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
-        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
-          pack_gather_batch_thread<W>(field, stage_base, b, bx, by, bz, tx, s.block_x, s.grid_y);
-        }
-      }
+                  const PackTable& t) -> void {
+  const PackLaunchShape s = pack_table_launch_shape(t);
+  for (uint32_t block = 0; block < s.grid_x; ++block) {
+    for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+      pack_gather_table_thread<W>(field, stage_base, t, block, tx, s.block_x);
     }
   }
 }
 
-/** Host reference of a fused scatter launch. */
+/** Host reference of a fused scatter launch (@p t viewing host memory). */
 template <typename W>
 inline auto
-host_scatter_batch(const W* stage_base,
+host_scatter_table(const W* stage_base,
                    W* field,
-                   const PackBatch& b) -> void {
-  const PackLaunchShape s = pack_batch_launch_shape(b);
-  for (uint32_t bz = 0; bz < s.grid_z; ++bz) {
-    for (uint32_t by = 0; by < s.grid_y; ++by) {
-      for (uint32_t bx = 0; bx < s.grid_x; ++bx) {
-        for (uint32_t tx = 0; tx < s.block_x; ++tx) {
-          pack_scatter_batch_thread<W>(stage_base, field, b, bx, by, bz, tx, s.block_x, s.grid_y);
-        }
-      }
+                   const PackTable& t) -> void {
+  const PackLaunchShape s = pack_table_launch_shape(t);
+  for (uint32_t block = 0; block < s.grid_x; ++block) {
+    for (uint32_t tx = 0; tx < s.block_x; ++tx) {
+      pack_scatter_table_thread<W>(stage_base, field, t, block, tx, s.block_x);
     }
   }
 }
@@ -378,31 +423,107 @@ struct PackStep {
   size_t stage_offset{};  ///< element offset into the HaloDistributed's staging buffer
 };
 
-/** Build a batch from @p steps (@p n in 1..kMaxPackBatchSteps). */
+/** Alignment of every array in a @ref PackTableImage, and of the image size. */
+inline constexpr size_t kPackTableAlign = 16U;
+
+/**
+ * The arrays of a @ref PackTable serialized into one byte image: @c steps , @c stage_offsets ,
+ * @c grid_x , @c grid_y and @c block_prefix , each at a @ref kPackTableAlign aligned offset. The
+ * image size is a multiple of @ref kPackTableAlign , so images concatenated back to back stay
+ * aligned. Copy @c bytes anywhere @ref kPackTableAlign aligned (host or device) and @ref view it.
+ */
+struct PackTableImage {
+  std::vector<std::byte> bytes{};
+  size_t stage_offsets_at{};
+  size_t grid_x_at{};
+  size_t grid_y_at{};
+  size_t block_prefix_at{};
+  uint32_t num_steps{};
+  uint32_t total_blocks{};
+
+  /** The table, for an image whose bytes start at @p base . */
+  [[nodiscard]] auto
+  view(const std::byte* base) const noexcept -> PackTable {
+    PackTable t;
+    t.steps = reinterpret_cast<const PackKernelArgs*>(base);
+    t.stage_offsets = reinterpret_cast<const size_t*>(base + stage_offsets_at);
+    t.grid_x = reinterpret_cast<const uint32_t*>(base + grid_x_at);
+    t.grid_y = reinterpret_cast<const uint32_t*>(base + grid_y_at);
+    t.block_prefix = reinterpret_cast<const uint32_t*>(base + block_prefix_at);
+    t.num_steps = num_steps;
+    t.total_blocks = total_blocks;
+    return t;
+  }
+};
+
+namespace detail_plan {
+
+constexpr auto
+align_up(size_t n) noexcept -> size_t {
+  return (n + kPackTableAlign - 1U) / kPackTableAlign * kPackTableAlign;
+}
+
+template <typename V>
+auto
+put_array(std::vector<std::byte>& bytes,
+          size_t at,
+          const std::vector<V>& values) -> void {
+  std::memcpy(bytes.data() + at, values.data(), values.size() * sizeof(V));
+}
+
+}  // namespace detail_plan
+
+/** Build the table image of @p steps (@p n >= 1, every step non-empty). */
 [[nodiscard]] inline auto
-make_pack_batch(const PackStep* steps,
-                size_t n) -> PackBatch {
-  if (n == 0U || n > kMaxPackBatchSteps) {
-    throw std::invalid_argument("make_pack_batch: step count out of range");
+make_pack_table_image(const PackStep* steps,
+                      size_t n) -> PackTableImage {
+  if (n == 0U || n > static_cast<size_t>(UINT32_MAX - 1U)) {
+    throw std::invalid_argument("make_pack_table_image: step count out of range");
   }
-  PackBatch b;
-  b.num_steps = static_cast<uint32_t>(n);
-  b.z_prefix[0] = 0U;
+  std::vector<PackKernelArgs> args(n);
+  std::vector<size_t> stage_offsets(n);
+  std::vector<uint32_t> grid_x(n);
+  std::vector<uint32_t> grid_y(n);
+  std::vector<uint32_t> block_prefix(n + 1U);
+  uint64_t blocks = 0U;
   for (size_t i = 0; i < n; ++i) {
-    b.steps[i] = steps[i].args;
-    b.stage_offsets[i] = steps[i].stage_offset;
-    if (b.steps[i].num_comps == 0U) {
-      throw std::invalid_argument("make_pack_batch: empty step");
+    const PackKernelArgs& a = steps[i].args;
+    if (a.num_comps == 0U || a.row == 0U || a.ext_z == 0U) {
+      throw std::invalid_argument("make_pack_table_image: empty step");
     }
-    b.z_prefix[i + 1U] = b.z_prefix[i] + b.steps[i].num_comps;
+    const PackLaunchShape s = pack_launch_shape(a);
+    args[i] = a;
+    stage_offsets[i] = steps[i].stage_offset;
+    grid_x[i] = s.grid_x;
+    grid_y[i] = s.grid_y;
+    block_prefix[i] = static_cast<uint32_t>(blocks);
+    blocks += static_cast<uint64_t>(s.grid_x) * s.grid_y * s.grid_z;
+    if (blocks > static_cast<uint64_t>(INT32_MAX)) {
+      throw std::invalid_argument("make_pack_table_image: table exceeds the 1D launch range");
+    }
   }
-  b.total_z = b.z_prefix[n];
-  return b;
+  block_prefix[n] = static_cast<uint32_t>(blocks);
+
+  using detail_plan::align_up;
+  PackTableImage img;
+  img.num_steps = static_cast<uint32_t>(n);
+  img.total_blocks = static_cast<uint32_t>(blocks);
+  img.stage_offsets_at = align_up(n * sizeof(PackKernelArgs));
+  img.grid_x_at = align_up(img.stage_offsets_at + n * sizeof(size_t));
+  img.grid_y_at = align_up(img.grid_x_at + n * sizeof(uint32_t));
+  img.block_prefix_at = align_up(img.grid_y_at + n * sizeof(uint32_t));
+  img.bytes.assign(align_up(img.block_prefix_at + (n + 1U) * sizeof(uint32_t)), std::byte{0});
+  detail_plan::put_array(img.bytes, 0U, args);
+  detail_plan::put_array(img.bytes, img.stage_offsets_at, stage_offsets);
+  detail_plan::put_array(img.bytes, img.grid_x_at, grid_x);
+  detail_plan::put_array(img.bytes, img.grid_y_at, grid_y);
+  detail_plan::put_array(img.bytes, img.block_prefix_at, block_prefix);
+  return img;
 }
 
 [[nodiscard]] inline auto
-make_pack_batch(const std::vector<PackStep>& steps) -> PackBatch {
-  return make_pack_batch(steps.data(), steps.size());
+make_pack_table_image(const std::vector<PackStep>& steps) -> PackTableImage {
+  return make_pack_table_image(steps.data(), steps.size());
 }
 
 /** One cross-rank message over a contiguous staging region. */
@@ -411,7 +532,9 @@ struct PackMsg {
   MsgOp op{MsgOp::Send};
   size_t first{};  ///< element offset into the staging buffer
   size_t count{};  ///< elements
-  /// (axis, src_rank, src_side, dst_rank, dst_side): identical on both ends of a message.
+  /// Identical on both ends of a message: (axis, src_rank, src_side, dst_rank, dst_side) for the
+  /// staged plan, (direction code from sender, src_rank, 0, dst_rank, 0) for Pencil and Brick
+  /// Direct.
   std::tuple<int, int, int, int, int> key{};
 };
 
@@ -674,6 +797,405 @@ build_axis_pack_plan(const ProcessGrid& pg,
                            count,
                            {axis_id, static_cast<int>(nb.rank), peer_side,
                             static_cast<int>(local_rank), local_side}});
+      cursor += count;
+    }
+  }
+
+  plan.stage_elems = cursor - stage_base;
+  return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Pencil Direct plan (HaloExchangeMode::Direct)
+// ---------------------------------------------------------------------------
+
+/** Direction to a neighbour in process-grid @c (y, z) coordinates; each component in -1..1. */
+struct PencilDirectDir {
+  int32_t dy{};
+  int32_t dz{};
+};
+
+/** The four faces and four YZ edges of a Pencil span. */
+inline constexpr PencilDirectDir kPencilDirectDirs[8] = {
+    {0, 1}, {0, -1}, {1, 0}, {-1, 0}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1},
+};
+
+/** Distinct code per direction, used in message keys. */
+[[nodiscard]] constexpr auto
+pencil_direct_code(PencilDirectDir d) noexcept -> int {
+  return (d.dy + 1) * 3 + (d.dz + 1);
+}
+
+/**
+ * Rank and coordinates of the neighbour at @p coords + @p d , wrapping periodic axes; absent past an
+ * open edge of the process grid (on either axis of an edge direction).
+ */
+[[nodiscard]] inline auto
+pencil_direct_neighbour(const ProcessGrid& pg,
+                        int32_3d coords,
+                        PencilDirectDir d,
+                        BoundaryModeDistributed boundary) -> halo_distributed_build::AxisNeighbour {
+  using halo_distributed_build::axis_neighbour;
+  halo_distributed_build::AxisNeighbour nb{true, true, coords, pg.rank_of(coords)};
+  if (d.dy != 0) {
+    nb = axis_neighbour(pg, nb.coords, Axis::Y, boundary,
+                        d.dy < 0 ? AxisSide::Lower : AxisSide::Upper);
+    if (!nb.present) {
+      return {};
+    }
+  }
+  if (d.dz != 0) {
+    nb = axis_neighbour(pg, nb.coords, Axis::Z, boundary,
+                        d.dz < 0 ? AxisSide::Lower : AxisSide::Upper);
+    if (!nb.present) {
+      return {};
+    }
+  }
+  nb.self = nb.coords.y == coords.y && nb.coords.z == coords.z;
+  return nb;
+}
+
+namespace detail_plan {
+
+/** Owned cells along one axis that the neighbour at step @p k needs (@p k in -1..1). */
+constexpr auto
+direct_send_range(int32_t k,
+                  int64_t owned,
+                  int64_t halo,
+                  int64_t& lo,
+                  int64_t& ext) noexcept -> void {
+  lo = k > 0 ? owned : halo;
+  ext = k == 0 ? owned : halo;
+}
+
+/** Halo cells along one axis filled from the neighbour at step @p k . */
+constexpr auto
+direct_recv_range(int32_t k,
+                  int64_t owned,
+                  int64_t halo,
+                  int64_t& lo,
+                  int64_t& ext) noexcept -> void {
+  lo = k < 0 ? 0 : (k > 0 ? halo + owned : halo);
+  ext = k == 0 ? owned : halo;
+}
+
+}  // namespace detail_plan
+
+/** Owned box this rank sends to the neighbour at @p d (full x; pencil spans have no x halo). */
+[[nodiscard]] inline auto
+pencil_direct_send_box(const AxisGeometry& g,
+                       PencilDirectDir d) -> PackBox {
+  PackBox b{0, 0, 0, g.haloed.x, 0, 0};
+  detail_plan::direct_send_range(d.dy, g.owned.y, g.halo.y, b.lo_y, b.ext_y);
+  detail_plan::direct_send_range(d.dz, g.owned.z, g.halo.z, b.lo_z, b.ext_z);
+  return b;
+}
+
+/** Halo box this rank fills from the neighbour at @p d . */
+[[nodiscard]] inline auto
+pencil_direct_recv_box(const AxisGeometry& g,
+                       PencilDirectDir d) -> PackBox {
+  PackBox b{0, 0, 0, g.haloed.x, 0, 0};
+  detail_plan::direct_recv_range(d.dy, g.owned.y, g.halo.y, b.lo_y, b.ext_y);
+  detail_plan::direct_recv_range(d.dz, g.owned.z, g.halo.z, b.lo_z, b.ext_z);
+  return b;
+}
+
+/**
+ * Build the single-pass packed plan of a Pencil span (@c halo.x == 0, @c halo.y and @c halo.z > 0)
+ * for one rank: faces and YZ edges are exchanged directly with all eight neighbours, so no halo
+ * cell depends on another exchange and the whole update is one gather, one message group and one
+ * scatter.
+ *
+ * @param send_active (component, dy, dz) -> bool: component goes to the neighbour at (dy, dz).
+ * @param recv_active (component, dy, dz) -> bool: component comes from the neighbour at (dy, dz).
+ * Both ends of a message evaluate the same set because recv_active(c, -d) on the receiver must
+ * equal send_active(c, d) on the sender (true for the stencil semantics HaloDistributed builds).
+ *
+ * Per direction: cross-rank sends this rank's owned box and receives into its halo box; a
+ * self-wrap (periodic axis owned by this rank alone) copies the owned box of the opposite
+ * direction into the halo box through the staging buffer, with no message. Absent neighbours
+ * (open axes) leave the corresponding halo cells untouched, matching the staged path.
+ */
+template <typename SendActive,
+          typename RecvActive>
+[[nodiscard]] inline auto
+build_pencil_direct_pack_plan(const ProcessGrid& pg,
+                              BoundaryModeDistributed boundary,
+                              int32_3d coords,
+                              int32_t local_rank,
+                              const AxisGeometry& g,
+                              int components,
+                              int64_t comp_stride,
+                              SendActive&& send_active,
+                              RecvActive&& recv_active,
+                              size_t stage_base) -> AxisPackPlan {
+  AxisPackPlan plan;
+  if (g.halo.x != 0 || g.halo.y <= 0 || g.halo.z <= 0) {
+    throw std::invalid_argument(
+        "halo pack: Pencil Direct needs halo.x == 0 and halo.y, halo.z > 0");
+  }
+  if (g.owned.y < g.halo.y || g.owned.z < g.halo.z) {
+    throw std::invalid_argument("halo pack: owned extent is smaller than the halo");
+  }
+
+  size_t cursor = stage_base;
+  for (const PencilDirectDir d : kPencilDirectDirs) {
+    const auto nb = pencil_direct_neighbour(pg, coords, d, boundary);
+    if (!nb.present) {
+      continue;
+    }
+    const PencilDirectDir opposite{-d.dy, -d.dz};
+
+    std::vector<int> send_comps;
+    std::vector<int> recv_comps;
+    for (int c = 0; c < components; ++c) {
+      if (send_active(c, d.dy, d.dz)) {
+        send_comps.push_back(c);
+      }
+      if (recv_active(c, d.dy, d.dz)) {
+        recv_comps.push_back(c);
+      }
+    }
+
+    const PackBox recv_box = pencil_direct_recv_box(g, d);
+
+    if (nb.rank == local_rank) {
+      const PackBox src_box = pencil_direct_send_box(g, opposite);
+      const size_t region = cursor;
+      detail_plan::append_steps(plan.gathers, src_box, recv_comps, g, comp_stride, region);
+      detail_plan::append_steps(plan.scatters, recv_box, recv_comps, g, comp_stride, region);
+      cursor += recv_comps.size() * recv_box.volume();
+      continue;
+    }
+
+    const PackBox send_box = pencil_direct_send_box(g, d);
+    if (!send_comps.empty() && send_box.volume() > 0U) {
+      const size_t region = cursor;
+      detail_plan::append_steps(plan.gathers, send_box, send_comps, g, comp_stride, region);
+      const size_t count = send_comps.size() * send_box.volume();
+      plan.msgs.push_back(
+          {nb.rank,
+           MsgOp::Send,
+           region,
+           count,
+           {pencil_direct_code(d), static_cast<int>(local_rank), 0, static_cast<int>(nb.rank), 0}});
+      cursor += count;
+    }
+    if (!recv_comps.empty() && recv_box.volume() > 0U) {
+      const size_t region = cursor;
+      detail_plan::append_steps(plan.scatters, recv_box, recv_comps, g, comp_stride, region);
+      const size_t count = recv_comps.size() * recv_box.volume();
+      plan.msgs.push_back({nb.rank,
+                           MsgOp::Recv,
+                           region,
+                           count,
+                           {pencil_direct_code(opposite), static_cast<int>(nb.rank), 0,
+                            static_cast<int>(local_rank), 0}});
+      cursor += count;
+    }
+  }
+
+  plan.stage_elems = cursor - stage_base;
+  return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Brick Direct plan (HaloExchangeMode::Direct)
+// ---------------------------------------------------------------------------
+
+/** Direction to a neighbour in process-grid @c (x, y, z) coordinates; each component in -1..1. */
+struct DirectDir {
+  int32_t dx{};
+  int32_t dy{};
+  int32_t dz{};
+};
+
+/** The six faces, twelve edges and eight corners of a Brick span. */
+inline constexpr DirectDir kBrickDirectDirs[26] = {
+    {1, 0, 0},   {-1, 0, 0}, {0, 1, 0},   {0, -1, 0},  {0, 0, 1},    {0, 0, -1}, {1, 1, 0},
+    {1, -1, 0},  {-1, 1, 0}, {-1, -1, 0}, {1, 0, 1},   {1, 0, -1},   {-1, 0, 1}, {-1, 0, -1},
+    {0, 1, 1},   {0, 1, -1}, {0, -1, 1},  {0, -1, -1}, {1, 1, 1},    {1, 1, -1}, {1, -1, 1},
+    {1, -1, -1}, {-1, 1, 1}, {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1},
+};
+
+/** Distinct code per direction, used in message keys. */
+[[nodiscard]] constexpr auto
+direct_code(DirectDir d) noexcept -> int {
+  return (d.dx + 1) * 9 + (d.dy + 1) * 3 + (d.dz + 1);
+}
+
+/**
+ * Rank and coordinates of the neighbour at @p coords + @p d , wrapping periodic axes; absent past an
+ * open edge of the process grid on any axis of the direction.
+ */
+[[nodiscard]] inline auto
+direct_neighbour(const ProcessGrid& pg,
+                 int32_3d coords,
+                 DirectDir d,
+                 BoundaryModeDistributed boundary) -> halo_distributed_build::AxisNeighbour {
+  using halo_distributed_build::axis_neighbour;
+  halo_distributed_build::AxisNeighbour nb{true, true, coords, pg.rank_of(coords)};
+  const int32_t steps[3] = {d.dx, d.dy, d.dz};
+  const Axis axes[3] = {Axis::X, Axis::Y, Axis::Z};
+  for (int i = 0; i < 3; ++i) {
+    if (steps[i] == 0) {
+      continue;
+    }
+    nb = axis_neighbour(pg, nb.coords, axes[i], boundary,
+                        steps[i] < 0 ? AxisSide::Lower : AxisSide::Upper);
+    if (!nb.present) {
+      return {};
+    }
+  }
+  nb.self = nb.coords.x == coords.x && nb.coords.y == coords.y && nb.coords.z == coords.z;
+  return nb;
+}
+
+/** Owned box this rank sends to the neighbour at @p d . */
+[[nodiscard]] inline auto
+brick_direct_send_box(const AxisGeometry& g,
+                      DirectDir d) -> PackBox {
+  PackBox b;
+  detail_plan::direct_send_range(d.dx, g.owned.x, g.halo.x, b.lo_x, b.ext_x);
+  detail_plan::direct_send_range(d.dy, g.owned.y, g.halo.y, b.lo_y, b.ext_y);
+  detail_plan::direct_send_range(d.dz, g.owned.z, g.halo.z, b.lo_z, b.ext_z);
+  return b;
+}
+
+/** Halo box this rank fills from the neighbour at @p d . */
+[[nodiscard]] inline auto
+brick_direct_recv_box(const AxisGeometry& g,
+                      DirectDir d) -> PackBox {
+  PackBox b;
+  detail_plan::direct_recv_range(d.dx, g.owned.x, g.halo.x, b.lo_x, b.ext_x);
+  detail_plan::direct_recv_range(d.dy, g.owned.y, g.halo.y, b.lo_y, b.ext_y);
+  detail_plan::direct_recv_range(d.dz, g.owned.z, g.halo.z, b.lo_z, b.ext_z);
+  return b;
+}
+
+/**
+ * True for a box too narrow in x and y to fill a @c kPackBlockX row but long in z (the edges along
+ * z of a brick). Such boxes are packed with y and z swapped so the long axis runs along the row.
+ * Depends on the extents only, so both ends of a message (and both halves of a self wrap) agree on
+ * the staging layout.
+ */
+[[nodiscard]] constexpr auto
+pack_swap_yz(const PackBox& b) noexcept -> bool {
+  return b.ext_x * b.ext_y < static_cast<int64_t>(kPackBlockX) && b.ext_z > b.ext_y;
+}
+
+namespace detail_plan {
+
+/** @ref append_steps , packing @ref pack_swap_yz boxes with the y and z roles exchanged. */
+inline auto
+append_oriented_steps(std::vector<PackStep>& out,
+                      const PackBox& box,
+                      const std::vector<int>& comps,
+                      const AxisGeometry& g,
+                      int64_t comp_stride,
+                      size_t region_offset) -> void {
+  if (!pack_swap_yz(box)) {
+    append_steps(out, box, comps, g, comp_stride, region_offset);
+    return;
+  }
+  const PackBox swapped{box.lo_x, box.lo_z, box.lo_y, box.ext_x, box.ext_z, box.ext_y};
+  const size_t first = out.size();
+  append_steps(out, swapped, comps, g, comp_stride, region_offset);
+  for (size_t i = first; i < out.size(); ++i) {
+    std::swap(out[i].args.haloed_x, out[i].args.pitch);
+  }
+}
+
+}  // namespace detail_plan
+
+/**
+ * Build the single-pass packed plan of a Brick span (@c halo.x > 0) for one rank: faces, edges and
+ * corners are exchanged directly with all 26 neighbours, so no halo cell depends on another
+ * exchange and the whole update is one gather, one message group and one scatter. Same contract
+ * as @ref build_pencil_direct_pack_plan , with predicates taking (component, dx, dy, dz).
+ *
+ * Directions whose box is empty (an axis without a halo) are skipped.
+ */
+template <typename SendActive,
+          typename RecvActive>
+[[nodiscard]] inline auto
+build_brick_direct_pack_plan(const ProcessGrid& pg,
+                             BoundaryModeDistributed boundary,
+                             int32_3d coords,
+                             int32_t local_rank,
+                             const AxisGeometry& g,
+                             int components,
+                             int64_t comp_stride,
+                             SendActive&& send_active,
+                             RecvActive&& recv_active,
+                             size_t stage_base) -> AxisPackPlan {
+  AxisPackPlan plan;
+  if (g.halo.x <= 0) {
+    throw std::invalid_argument("halo pack: Brick Direct needs halo.x > 0");
+  }
+  if (g.owned.x < g.halo.x || g.owned.y < g.halo.y || g.owned.z < g.halo.z) {
+    throw std::invalid_argument("halo pack: owned extent is smaller than the halo");
+  }
+
+  size_t cursor = stage_base;
+  for (const DirectDir d : kBrickDirectDirs) {
+    const PackBox recv_box = brick_direct_recv_box(g, d);
+    if (recv_box.volume() == 0U) {
+      continue;
+    }
+    const auto nb = direct_neighbour(pg, coords, d, boundary);
+    if (!nb.present) {
+      continue;
+    }
+    const DirectDir opposite{-d.dx, -d.dy, -d.dz};
+
+    std::vector<int> send_comps;
+    std::vector<int> recv_comps;
+    for (int c = 0; c < components; ++c) {
+      if (send_active(c, d.dx, d.dy, d.dz)) {
+        send_comps.push_back(c);
+      }
+      if (recv_active(c, d.dx, d.dy, d.dz)) {
+        recv_comps.push_back(c);
+      }
+    }
+
+    if (nb.rank == local_rank) {
+      const PackBox src_box = brick_direct_send_box(g, opposite);
+      const size_t region = cursor;
+      detail_plan::append_oriented_steps(plan.gathers, src_box, recv_comps, g, comp_stride, region);
+      detail_plan::append_oriented_steps(plan.scatters, recv_box, recv_comps, g, comp_stride,
+                                         region);
+      cursor += recv_comps.size() * recv_box.volume();
+      continue;
+    }
+
+    const PackBox send_box = brick_direct_send_box(g, d);
+    if (!send_comps.empty()) {
+      const size_t region = cursor;
+      detail_plan::append_oriented_steps(plan.gathers, send_box, send_comps, g, comp_stride,
+                                         region);
+      const size_t count = send_comps.size() * send_box.volume();
+      plan.msgs.push_back(
+          {nb.rank,
+           MsgOp::Send,
+           region,
+           count,
+           {direct_code(d), static_cast<int>(local_rank), 0, static_cast<int>(nb.rank), 0}});
+      cursor += count;
+    }
+    if (!recv_comps.empty()) {
+      const size_t region = cursor;
+      detail_plan::append_oriented_steps(plan.scatters, recv_box, recv_comps, g, comp_stride,
+                                         region);
+      const size_t count = recv_comps.size() * recv_box.volume();
+      plan.msgs.push_back(
+          {nb.rank,
+           MsgOp::Recv,
+           region,
+           count,
+           {direct_code(opposite), static_cast<int>(nb.rank), 0, static_cast<int>(local_rank), 0}});
       cursor += count;
     }
   }

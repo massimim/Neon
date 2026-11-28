@@ -1,5 +1,6 @@
 #include <carbon/dense_distributed.h>
 #include <carbon/detail/dense/launch_shape.h>
+#include <carbon/detail/dense_distributed/brick_boundary.h>
 #include <carbon/detail/dense_distributed/layout.h>
 #include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/distributed.h>
@@ -87,7 +88,8 @@ DenseDistributed::init_common_(System system,
                                float32_3d origin,
                                float spacing,
                                ProcessGrid process_grid,
-                               std::optional<LaunchShape> block_override) {
+                               std::optional<LaunchShape> block_override,
+                               HaloExchangeMode halo_exchange) {
   if (!std::isfinite(spacing) || spacing <= 0.0F) {
     log::throw_with_log<std::invalid_argument>(
         "DenseDistributed: spacing must be finite and strictly positive (spacing={})", spacing);
@@ -114,6 +116,7 @@ DenseDistributed::init_common_(System system,
   system_ = std::move(system);
   stencil_ = std::move(stencil);
   boundary_mode_ = boundary_mode;
+  halo_exchange_ = halo_exchange;
   origin_ = origin;
   spacing_ = spacing;
   process_grid_ = std::move(process_grid);
@@ -218,6 +221,10 @@ DenseDistributed::init_common_(System system,
           detail::dense_distributed::uses_pencil_boundary_launch(spans_[i], block)) {
         grid = detail::dense_distributed::pencil_boundary_grid(
             detail::dense_distributed::pencil_boundary_layout(spans_[i]), block);
+      } else if (view == DataView::Boundary &&
+                 detail::dense_distributed::uses_brick_boundary_launch(spans_[i], block)) {
+        grid = detail::dense_distributed::brick_boundary_grid(
+            detail::dense_distributed::brick_boundary_layout(spans_[i]), block);
       }
       return grid;
     });
@@ -230,13 +237,14 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   HaloExchangeMode halo_exchange)
     : DenseDistributed() {
   const int world_size = resolve_world_size(system);
   const ProcessGrid pg =
       world_size > 0 ? ProcessGrid::make(world_size, DecompositionMode::Slab) : ProcessGrid{};
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               pg, block_override);
+               pg, block_override, halo_exchange);
 }
 
 DenseDistributed::DenseDistributed(System system,
@@ -246,13 +254,14 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   HaloExchangeMode halo_exchange)
     : DenseDistributed() {
   const int world_size = resolve_world_size(system);
   const ProcessGrid pg =
       world_size > 0 ? ProcessGrid::make(world_size, decomposition) : ProcessGrid{};
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               pg, block_override);
+               pg, block_override, halo_exchange);
 }
 
 DenseDistributed::DenseDistributed(System system,
@@ -262,10 +271,11 @@ DenseDistributed::DenseDistributed(System system,
                                    BoundaryModeDistributed boundary_mode,
                                    float32_3d origin,
                                    float spacing,
-                                   std::optional<LaunchShape> block_override)
+                                   std::optional<LaunchShape> block_override,
+                                   HaloExchangeMode halo_exchange)
     : DenseDistributed() {
   init_common_(std::move(system), global_extent, std::move(stencil), boundary_mode, origin, spacing,
-               std::move(process_grid), block_override);
+               std::move(process_grid), block_override, halo_exchange);
 }
 
 auto
@@ -307,6 +317,11 @@ DenseDistributed::stencil() const noexcept -> const Stencil& {
 auto
 DenseDistributed::boundary_mode() const noexcept -> BoundaryModeDistributed {
   return boundary_mode_;
+}
+
+auto
+DenseDistributed::halo_exchange() const noexcept -> HaloExchangeMode {
+  return halo_exchange_;
 }
 
 auto

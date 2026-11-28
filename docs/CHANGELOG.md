@@ -6736,3 +6736,125 @@ This unblocked the matrix on this host: the `sycl` and `hip-nvidia` images build
   `src/halo_pack.cu`). A typical two-sided Z pass is therefore one gather and one scatter.
   Host coverage in `tests/test_halo_pack_plan.cpp`. Pencil 1x2x4 LBM interior rank: pack
   launches per step 6 -> 4 (ncu gathers/dense = scatters/dense = 2.0).
+- **2026-11 — Pencil Direct halo exchange (`HaloExchangeMode`).** `DenseDistributed` ctors take a
+  final `HaloExchangeMode halo_exchange = Staged` (accessor `halo_exchange()`), read by
+  `HaloDistributed` when it builds the exchange. `Staged` is the X -> Y -> Z pass sequence, where
+  edge halos travel through the face neighbours of the later pass. `Direct` applies to Pencil
+  spans on the packed path (`halo.x == 0`, `halo.y`, `halo.z > 0`, one local GPU): the faces and
+  the four YZ edges go straight to all eight neighbours, so the exchange is one gather, one NCCL
+  group and one scatter, with no pass ordering (`build_pencil_direct_pack_plan` in
+  `detail/halo_pack_plan.h`). Lattice filters use the same `crosses(sign, c)` rule as the Disg
+  pencil plan; self wraps on periodic single-rank axes are gather/scatter only. Slab, Brick and
+  unpacked layouts ignore the option and stay `Staged`; host launches keep the staged copies.
+  The Direct batch mixes rows of very different shapes (Z faces wide in the row, Y faces and
+  edges long in z), so `PackBatch` now gives each step its own block range of a 1D grid
+  (`block_prefix`, step grid flattened component-major) instead of sharing one x/y grid across
+  `blockIdx.z`; `kMaxPackBatchSteps` is 16 (eight directions x two 32-component chunks).
+  `lbm_ldc` and `cg_poisson` gain `--halo-exchange staged|direct`. Tests:
+  `test_halo_pack_plan` runs Direct and the staged plan on emulated 1x2x2 ... 1x4x2 worlds (open,
+  periodic Y / Z / YZ, r = 1 and 2) and checks every cell against the global field, including
+  D3Q19 lattice filters. N=256, pencil 1x2x4, 8 A100, NCCL 2.27.7 (3 rounds): pack launches per
+  LBM step 4 -> 2; LBM 38,354 -> 44,773 MLUPS (+16.7 %) with `--overlap standard` and
+  40,986 -> 46,819 (+14.2 %) with `none`; CG 0.463 -> 0.438 ms/iter (-5.4 %) and
+  0.443 -> 0.421 (-5.0 %). Checksums and CG residual bitwise unchanged; slab with `Direct`
+  issues the same messages as `Staged`.
+- **2026-11 — Kernel graphs: composite kernels expanded by the `Skeleton`.** A kernel can describe
+  itself as a graph of child kernels (`detail::KernelGraph`: children plus edges, with dummy head
+  `kHead` and tail `kTail`) through `KernelImpl::expand(self)`. `Skeleton::compile` keeps the
+  composite as one node through dependency analysis and the overlap rewrite (its tokens must cover
+  every child access, checked), then `compile_expand_kernel_graphs_` replaces it: the composite's
+  data and hint predecessors feed the head's successors, the tail's predecessors feed its
+  successors; children with no predecessor or successor are tied to head / tail; nested composites
+  expand in turn; cycles throw. Children are appended to `effective_kernels()` with
+  `effective_to_user() == kNoKernel` and the new `effective_parent()`; `edges()`, `min_edges()` and
+  `kernel_streams()` cover them; streams are picked freely by the existing rules (children are
+  Halo-kind). Expansion happens after OCC so overlap decisions stay those of the whole halo; a
+  composite split into Internal / Boundary views is not expanded. `KernelImpl::communicates()`
+  (default: every halo) drives `halo_messages()` and a data-edge chain between consecutive
+  communicating children, so free stream placement cannot reorder NCCL groups across ranks.
+  `Options::expand_kernel_graphs{true}` / `CARBON_EXPAND_KERNEL_GRAPHS=0` turn it off; both enter
+  the rank-consistency hash. First user: `HaloDistributed` on the one-local-GPU packed path
+  (`kernel_graph`), with three children per axis pass,
+  `<halo>/<x|y|z|direct>.<gather|exchange|scatter>` (`launch_phase`, `dist_messages_of_pass`;
+  `operator()` now runs the same phases). Halos with fences, barriers or intra-process copies stay
+  one node. Tests: `test_skeleton_kernel_graph` (chain, diamond, dangling, empty, nested, rejects,
+  opt-out, overlap None / Standard / Extended). 8 A100, N=96: LBM pencil Staged / Direct, slab,
+  brick and CG pencil / slab, overlap none / standard, checksums and residuals bitwise equal on vs
+  off; `--export-transfers` identical apart from `seq` and labels. N=256 pencil 1x2x4 (2 rounds):
+  on vs off within 0.7 % for LBM and CG. The point is visibility: per-face Boundary dependencies
+  can now wait on one scatter instead of the whole halo.
+- **2026-11 — Brick Boundary view in one launch.** A `DenseDistributed` Brick span
+  (`halo.x > 0`) ran its Boundary view as six launches, one per face box, all with the 64x8
+  block: on the Y faces 7 of 8 thread rows exited at once, and the X faces, `r` cells wide in x,
+  ran one useful lane per warp (grid 1x32x254 at 256^3 owned). `launch_dense_grid` now runs the
+  six faces in one `dense_brick_boundary_kernel` launch, beside the pencil one: `blockIdx.z`
+  selects face and halo layer, and the thread axes walk (x, y) on the Z faces, (x, z) on the Y
+  faces and (y, z) on the X faces (`detail/dense_distributed/brick_boundary.h`, bands from
+  `Span::shell_bands()`). Used when the block has `z == 1`; other blocks, reduce and SYCL keep the
+  per-window launches. `gpu_grid(Boundary)` reports the launched grid. Tests: host coverage in
+  `test_dense_distributed_windows` (1,309 brick spans, five blocks), single-GPU
+  `test_dense_distributed_brick_boundary` (PeriodicX on a 1x1x1 grid), and
+  `CARBON_DIST_CASES=<substring>` in `test_dense_distributed_dist` to run the 4-rank brick cases,
+  which the known slab-periodicX failure otherwise skips. N=512, brick 2x2x2, 8 A100, NCCL 2.27.7,
+  `--overlap standard`, rank 0 under `ncu`: Boundary GPU time per step 233.8 -> 31.7 us (CG
+  matvec) but only 368.8 -> 326.9 us (LBM D3Q19), whose X faces stay bound by one 32-byte sector
+  per cell and population (old X face 159.8 us each); Internal kernels unchanged. End to end
+  (3 rounds): LBM 42,758 -> 43,302 MLUPS (+1.3 %), CG 2.224 -> 2.084 ms/iter median (-6.3 %);
+  checksums and CG residuals bitwise unchanged (also at N=96 / 101 with overlap none vs standard).
+- **2026-11 — Brick Direct halo exchange.** `HaloExchangeMode::Direct` now also applies to Brick
+  spans (`halo.x > 0`) on the packed path: faces, edges and corners go straight to up to 26
+  neighbours in one gather, one NCCL group and one scatter (`build_brick_direct_pack_plan`,
+  direction code `(dx+1)*9 + (dy+1)*3 + (dz+1)`, boxes from `direct_send_range` /
+  `direct_recv_range` on all three axes). Directions no population crosses are skipped with the
+  pencil `crosses` rule, so D3Q19 (no corner populations) sends 6 directions per rank on an open
+  2x2x2 grid: 3 faces of 2.62 MB and 3 edges of 4.1 KB at N=512. Thin z-edges
+  (`ext_x * ext_y < 256` and `ext_z > ext_y`) are packed with y and z swapped so a row covers the
+  long extent; both ends derive the swap from the box alone (ncu: 8,712 -> 7,692 blocks, about
+  3 % off the LBM gather and scatter). Tests: `test_halo_pack_plan` emulates x-split worlds and
+  checks Direct against the staged plan and the global truth (12 cases, D3Q19 / D3Q27 filters
+  uni- and bidirectional, thin-edge swap, self-wrap-only world, rejects `halo.x == 0`);
+  `test_dense_distributed_dist` takes `CARBON_DIST_HALO_EXCHANGE=staged|direct`. 8 ranks and 4-rank
+  brick pass in both modes; LBM checksums and CG residuals at N=96 / 101 bitwise equal between
+  modes. N=512, brick 2x2x2, 8 A100, NCCL 2.27.7, `--overlap standard`, median of 5 reps: LBM
+  43,286 -> 46,899 MLUPS (+8.3 %), CG 2.084 -> 2.028 ms/iter (-2.7 %). nsys shows why the gain is
+  this size: the LBM interior kernel fills every SM, so gather, NCCL and scatter only start in
+  its last ~70 us and the halo is exposed after it (about 650 us per step Staged with 9 kernels and
+  3 NCCL groups, about 317 us Direct with 3 kernels and 1 group). With `--hp-halo` the halo
+  overlaps and Staged and Direct converge (48,131 vs 48,127 MLUPS); the same holds for pencil
+  (62,894 vs 62,941). The `halo_exchange` sweep experiment (formerly `pencil_halo_exchange`) now
+  covers slab, pencil and brick (`pd` / `bd` in the plot key).
+- **2026-11 — Pack step tables in device memory.** The fused gather / scatter used to take a
+  `PackBatch` by value: at most 16 steps, bounded by the 4 KiB kernel-parameter limit, with
+  larger plans split into several launches. `PackTable` is now a view (pointers to `steps`,
+  `stage_offsets`, `grid_x`, `grid_y`, `block_prefix`, plus counts) of a `PackTableImage`, one
+  byte image with 16-byte aligned arrays. `HaloDistributed` concatenates the images of every
+  pass and phase into `pack_tables_` (one `Buffer<std::byte>`, uploaded once in the constructor
+  next to `stage_`), so each phase of a pass is one `launch_gather_table` / `launch_scatter_table`
+  whatever its step count. `kMaxPackBatchSteps` is gone; single-step `launch_gather` /
+  `launch_scatter` have their own 3D-grid kernel. The steps now come from global memory instead
+  of the parameter bank, so the step search is a dependent load at block start: a block's step is
+  the number of `block_prefix` entries at or below its index, minus one, counted 32 at a time
+  (`pack_prefix_count`: on CUDA one entry per lane and `__ballot_sync` + `__popc`; on the host and
+  other backends one thread reads the chunk), and one-step tables skip the search. Host tests view
+  the same image in host memory (`decode_blocks_many_steps`: 31 ... 70 steps, equal to a linear
+  scan). ncu, N=512 brick 2x2x2 rank 0, per exchange (by value / binary search / ballot):
+  brick Direct LBM gather 70.7 / 76.2 / 74.2 us, scatter 121.6 / 124.2 / 122.3 us; CG gather
+  11.4 / 13.1 / 12.8 us, scatter 10.2 / 11.5 / 11.2 us; Staged launches (one step on the corner
+  rank) unchanged with the one-step shortcut (the ballot alone cost them 1-2 us). Reading the step
+  arguments into registers before the loop changed nothing. Dist tests, LBM checksums and CG
+  residuals bitwise equal; N=512 MLUPS within 0.7 % of the by-value build for slab, pencil, pencil
+  Direct, brick and brick Direct (59,489 / 56,686 / 59,681 / 43,061 / 46,648).
+- **2026-11 — Halo exchange sweeps for LBM and CG.** The LBM sweep takes an `overlaps` matrix key
+  (each run once per mode; a run off the global `overlap` gets `-ov<mode>` in its label, so
+  existing reports keep their names; hp-halo on is skipped with overlap none) and a
+  `direct_speedup` figure (MLUPS direct / staged vs N per decomposition). The experiment
+  `pencil_halo_exchange` is now `halo_exchange`: slab, pencil and brick, staged and direct, at 4
+  and 8 GPUs (brick at 8), N = 256 ... 512, hp-halo off / on, overlap none / standard (120 runs, plus
+  `halo_exchange_reference` for the 1-GPU ideal line). `cg_poisson` gains `--hp-halo`, `--reps`
+  (splits the timed iterations into equal repetitions), `--label` and `--report PATH`, a
+  `carbon-cg-report-v1` JSON with the config, process grid, iteration-time statistics, MDOF/s
+  (cells x timed iterations / s) and per-repetition values; it also prints `MDOFS=` / `ITER_MS=`.
+  Every rank now exits 0 when the solve halts at `--max_iter` (only rank 0 did, so `mpiexec`
+  failed fixed-iteration runs). `benchmarks/cg/scripts/` holds the CG sweep with the same
+  experiment (`cg-sweep.yml`, `cg_sweep_config.py` on top of the LBM parser, `cg-sweep-run.sh`,
+  `plot_cg_scaling.py` with `vs_gpus` in MDOF/s per GPU and `direct_speedup`).

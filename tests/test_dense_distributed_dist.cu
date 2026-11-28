@@ -2,7 +2,10 @@
 //
 // Launched under `mpiexec -n 4 ./test_dense_distributed_dist` (one rank per GPU). With 8 ranks it
 // runs the full brick (2,2,2) instead; any other world size skips (returns 0), as does a node with
-// fewer visible devices than ranks.
+// fewer visible devices than ranks. CARBON_DIST_CASES=<substring> restricts the run to the cases
+// whose label contains it (for example `brick`). CARBON_DIST_HALO_EXCHANGE=direct builds every grid
+// with HaloExchangeMode::Direct (Pencil and Brick spans; Slab keeps Staged); the checks below are
+// unchanged because they compare against ground truth.
 //
 // Process grids (Px, Py, Pz) per world size, each in Open and periodic variants:
 //   4 ranks : slab (1,1,4) | pencil (1,2,2) | brick (2,2,1) and (2,1,2)
@@ -26,7 +29,8 @@
 //     auto-inserted from read_stencil and DenseDistributed::Span / Partition run on the device.
 //     Run once without overlap and once with OverlapMode::Standard, which splits the kernel into
 //     Internal + Boundary launches and therefore exercises those Span views for real. (For pencil
-//     and brick the Boundary launch is the compact shell, not the full owned extent.)
+//     and brick the Boundary view is one launch over all shell faces; see pencil_boundary.h and
+//     brick_boundary.h.)
 //
 //  3. VTK shard I/O. A 3-component float field goes host -> device -> host, is written with
 //     io::write_vtk (one XML `.rank<N>.vti` shard per rank) plus the `.vtm` index, and read back
@@ -61,6 +65,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -121,6 +126,18 @@ six_point() -> carbon::Stencil {
   return carbon::Stencil(
       std::vector<int32_3d>{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}},
       /*remove_center=*/true);
+}
+
+// Set once in main from CARBON_DIST_HALO_EXCHANGE; every grid of the run uses it.
+carbon::HaloExchangeMode g_halo_exchange = carbon::HaloExchangeMode::Staged;
+
+[[nodiscard]] auto
+make_grid(const carbon::System& sys,
+          const int64_3d& global,
+          const ProcessGrid& pg,
+          const carbon::Stencil& stencil,
+          BoundaryModeDistributed mode) -> DenseDistributed {
+  return DenseDistributed(sys, global, pg, stencil, mode, {}, 1.0F, std::nullopt, g_halo_exchange);
 }
 
 [[nodiscard]] auto
@@ -197,7 +214,7 @@ run_halo_once(carbon::System& sys,
                                  yp[static_cast<size_t>(coords.y)] - expected_halo.y,
                                  zp[static_cast<size_t>(coords.z)] - expected_halo.z};
 
-  DenseDistributed grid(sys, global, pg, stencil, mode);
+  DenseDistributed grid = make_grid(sys, global, pg, stencil, mode);
   const auto& span = grid.spans()[0];
   const int64_3d halo = span.halo();
   const int64_3d owned = span.logic_extent();
@@ -409,7 +426,7 @@ run_stencil(carbon::System& sys,
             carbon::OverlapMode overlap,
             const std::string& label,
             const int64_3d& global) -> bool {
-  DenseDistributed grid(sys, global, pg, six_point(), mode);
+  DenseDistributed grid = make_grid(sys, global, pg, six_point(), mode);
   const auto& span = grid.spans()[0];
   const int64_3d halo = span.halo();
   const int64_3d owned = span.logic_extent();
@@ -549,7 +566,7 @@ run_vtk(carbon::System& sys,
   const std::string index = base + ".vtm";
   bool ok = true;
   try {
-    DenseDistributed grid(sys, global, pg, six_point(), mode);
+    DenseDistributed grid = make_grid(sys, global, pg, six_point(), mode);
     const auto& span = grid.spans()[0];
     const int64_3d halo = span.halo();
     const int64_3d owned = span.logic_extent();
@@ -713,7 +730,7 @@ run_reduce_2d(carbon::System& sys,
               const char* label,
               const int64_3d& global) -> bool {
   try {
-    DenseDistributed grid(sys, global, pg, six_point(), mode);
+    DenseDistributed grid = make_grid(sys, global, pg, six_point(), mode);
     auto field = grid.template newField<int64_t, 1>(carbon::MemorySide::HostDevice);
     field.fill_owned_host([](carbon::int64_3d g, int /*c*/) {
       return static_cast<int64_t>(encode(g.x, g.y, g.z));
@@ -854,9 +871,27 @@ main() {
     };
   }
 
+  const char* exchange_env = std::getenv("CARBON_DIST_HALO_EXCHANGE");
+  const std::string exchange = exchange_env != nullptr ? exchange_env : "staged";
+  if (exchange == "direct") {
+    g_halo_exchange = carbon::HaloExchangeMode::Direct;
+  } else if (exchange != "staged") {
+    CARBON_LOG_ERROR("test_dense_distributed_dist: CARBON_DIST_HALO_EXCHANGE must be staged or "
+                     "direct");
+    return 1;
+  }
+
   // Deliberately uneven extents so chunks differ in size across ranks.
   const int64_3d global{9, 8, 11};
+  // CARBON_DIST_CASES=<substring> runs only the cases whose label contains it. Every rank reads the
+  // same environment, so all ranks run the same cases and stay in step in the collectives.
+  const char* filter_env = std::getenv("CARBON_DIST_CASES");
+  const std::string filter = filter_env != nullptr ? filter_env : "";
+  size_t ran = 0;
   for (const Case& c : cases) {
+    if (!filter.empty() && std::string(c.label).find(filter) == std::string::npos) {
+      continue;
+    }
     if (!run_halo<1>(sys, rank, c.pg, c.mode, c.label, global) ||
         (c.multi_component && !run_halo<3>(sys, rank, c.pg, c.mode, c.label, global)) ||
         !run_halo<6>(sys, rank, c.pg, c.mode, std::string(c.label) + "/lattice", global,
@@ -869,9 +904,10 @@ main() {
         !run_vtk(sys, rank, world, c.pg, c.mode, c.label, global)) {
       return 1;
     }
+    ++ran;
   }
 
-  CARBON_LOG_INFO("test_dense_distributed_dist: rank {} of {} ok ({} cases)", rank, world,
-                  cases.size());
+  CARBON_LOG_INFO("test_dense_distributed_dist: rank {} of {} ok ({} of {} cases, {} halo)", rank,
+                  world, ran, cases.size(), exchange);
   return 0;
 }

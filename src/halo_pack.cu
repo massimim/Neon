@@ -21,95 +21,118 @@ struct alignas(16) Word16 {
 
 template <typename W>
 __global__ void
-gather_batch_kernel(const W* __restrict__ field,
-                    W* __restrict__ stage_base,
-                    PackBatch b) {
-  pack_gather_batch_thread<W>(field, stage_base, b, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
-                              blockDim.x, gridDim.y);
+gather_step_kernel(const W* __restrict__ field,
+                   W* __restrict__ stage,
+                   PackKernelArgs a) {
+  pack_gather_thread<W>(field, stage, a, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+                        blockDim.x, gridDim.y);
 }
 
 template <typename W>
 __global__ void
-scatter_batch_kernel(const W* __restrict__ stage_base,
+scatter_step_kernel(const W* __restrict__ stage,
+                    W* __restrict__ field,
+                    PackKernelArgs a) {
+  pack_scatter_thread<W>(stage, field, a, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+                         blockDim.x, gridDim.y);
+}
+
+template <typename W>
+__global__ void
+gather_table_kernel(const W* __restrict__ field,
+                    W* __restrict__ stage_base,
+                    PackTable t) {
+  pack_gather_table_thread<W>(field, stage_base, t, blockIdx.x, threadIdx.x, blockDim.x);
+}
+
+template <typename W>
+__global__ void
+scatter_table_kernel(const W* __restrict__ stage_base,
                      W* __restrict__ field,
-                     PackBatch b) {
-  pack_scatter_batch_thread<W>(stage_base, field, b, blockIdx.x, blockIdx.y, blockIdx.z,
-                               threadIdx.x, blockDim.x, gridDim.y);
+                     PackTable t) {
+  pack_scatter_table_thread<W>(stage_base, field, t, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 template <typename W>
 auto
-gather_batch_as(const Gpu& gpu,
+gather_step_as(const Gpu& gpu,
+               gpu_stream_t stream,
+               const void* field,
+               void* stage,
+               const PackKernelArgs& a) -> gpu_error_t {
+  if (a.num_comps == 0U || a.row == 0U || a.ext_z == 0U) {
+    return gpu_success;
+  }
+  const PackLaunchShape s = pack_launch_shape(a);
+  return gpu.template typed_launch<&gather_step_kernel<W>>(
+      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
+      static_cast<const W*>(field), static_cast<W*>(stage), a);
+}
+
+template <typename W>
+auto
+scatter_step_as(const Gpu& gpu,
+                gpu_stream_t stream,
+                const void* stage,
+                void* field,
+                const PackKernelArgs& a) -> gpu_error_t {
+  if (a.num_comps == 0U || a.row == 0U || a.ext_z == 0U) {
+    return gpu_success;
+  }
+  const PackLaunchShape s = pack_launch_shape(a);
+  return gpu.template typed_launch<&scatter_step_kernel<W>>(
+      dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
+      static_cast<const W*>(stage), static_cast<W*>(field), a);
+}
+
+template <typename W>
+auto
+gather_table_as(const Gpu& gpu,
                 gpu_stream_t stream,
                 const void* field,
                 void* stage_base,
-                const PackBatch& b) -> gpu_error_t {
-  if (b.num_steps == 0U || b.total_z == 0U) {
+                const PackTable& t) -> gpu_error_t {
+  if (t.num_steps == 0U || t.total_blocks == 0U) {
     return gpu_success;
   }
-  const PackLaunchShape s = pack_batch_launch_shape(b);
-  return gpu.template typed_launch<&gather_batch_kernel<W>>(
+  const PackLaunchShape s = pack_table_launch_shape(t);
+  return gpu.template typed_launch<&gather_table_kernel<W>>(
       dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
-      static_cast<const W*>(field), static_cast<W*>(stage_base), b);
+      static_cast<const W*>(field), static_cast<W*>(stage_base), t);
 }
 
 template <typename W>
 auto
-scatter_batch_as(const Gpu& gpu,
+scatter_table_as(const Gpu& gpu,
                  gpu_stream_t stream,
                  const void* stage_base,
                  void* field,
-                 const PackBatch& b) -> gpu_error_t {
-  if (b.num_steps == 0U || b.total_z == 0U) {
+                 const PackTable& t) -> gpu_error_t {
+  if (t.num_steps == 0U || t.total_blocks == 0U) {
     return gpu_success;
   }
-  const PackLaunchShape s = pack_batch_launch_shape(b);
-  return gpu.template typed_launch<&scatter_batch_kernel<W>>(
+  const PackLaunchShape s = pack_table_launch_shape(t);
+  return gpu.template typed_launch<&scatter_table_kernel<W>>(
       dim3(s.grid_x, s.grid_y, s.grid_z), dim3(s.block_x, 1U, 1U), 0U, stream,
-      static_cast<const W*>(stage_base), static_cast<W*>(field), b);
+      static_cast<const W*>(stage_base), static_cast<W*>(field), t);
 }
 
+/** Calls @p f with a value of the word type matching @p elem_bytes (unsupported -> invalid). */
+template <typename F>
 auto
-dispatch_gather_batch(const Gpu& gpu,
-                      gpu_stream_t stream,
-                      std::size_t elem_bytes,
-                      const void* field_base,
-                      void* stage_base,
-                      const PackBatch& batch) -> gpu_error_t {
+dispatch_width(std::size_t elem_bytes,
+               F&& f) -> gpu_error_t {
   switch (elem_bytes) {
     case 1U:
-      return gather_batch_as<std::uint8_t>(gpu, stream, field_base, stage_base, batch);
+      return f(std::uint8_t{});
     case 2U:
-      return gather_batch_as<std::uint16_t>(gpu, stream, field_base, stage_base, batch);
+      return f(std::uint16_t{});
     case 4U:
-      return gather_batch_as<std::uint32_t>(gpu, stream, field_base, stage_base, batch);
+      return f(std::uint32_t{});
     case 8U:
-      return gather_batch_as<std::uint64_t>(gpu, stream, field_base, stage_base, batch);
+      return f(std::uint64_t{});
     case 16U:
-      return gather_batch_as<Word16>(gpu, stream, field_base, stage_base, batch);
-    default:
-      return gpu_error_invalid_value;
-  }
-}
-
-auto
-dispatch_scatter_batch(const Gpu& gpu,
-                       gpu_stream_t stream,
-                       std::size_t elem_bytes,
-                       const void* stage_base,
-                       void* field_base,
-                       const PackBatch& batch) -> gpu_error_t {
-  switch (elem_bytes) {
-    case 1U:
-      return scatter_batch_as<std::uint8_t>(gpu, stream, stage_base, field_base, batch);
-    case 2U:
-      return scatter_batch_as<std::uint16_t>(gpu, stream, stage_base, field_base, batch);
-    case 4U:
-      return scatter_batch_as<std::uint32_t>(gpu, stream, stage_base, field_base, batch);
-    case 8U:
-      return scatter_batch_as<std::uint64_t>(gpu, stream, stage_base, field_base, batch);
-    case 16U:
-      return scatter_batch_as<Word16>(gpu, stream, stage_base, field_base, batch);
+      return f(Word16{});
     default:
       return gpu_error_invalid_value;
   }
@@ -118,37 +141,15 @@ dispatch_scatter_batch(const Gpu& gpu,
 }  // namespace
 
 auto
-launch_gather_batch(const Gpu& gpu,
-                    gpu_stream_t stream,
-                    std::size_t elem_bytes,
-                    const void* field_base,
-                    void* stage_base,
-                    const PackBatch& batch) -> gpu_error_t {
-  return dispatch_gather_batch(gpu, stream, elem_bytes, field_base, stage_base, batch);
-}
-
-auto
-launch_scatter_batch(const Gpu& gpu,
-                     gpu_stream_t stream,
-                     std::size_t elem_bytes,
-                     const void* stage_base,
-                     void* field_base,
-                     const PackBatch& batch) -> gpu_error_t {
-  return dispatch_scatter_batch(gpu, stream, elem_bytes, stage_base, field_base, batch);
-}
-
-auto
 launch_gather(const Gpu& gpu,
               gpu_stream_t stream,
               std::size_t elem_bytes,
               const void* field_base,
               void* stage_region,
               const PackKernelArgs& a) -> gpu_error_t {
-  PackStep step;
-  step.args = a;
-  step.stage_offset = 0U;
-  return launch_gather_batch(gpu, stream, elem_bytes, field_base, stage_region,
-                             make_pack_batch(&step, 1U));
+  return dispatch_width(elem_bytes, [&](auto w) {
+    return gather_step_as<decltype(w)>(gpu, stream, field_base, stage_region, a);
+  });
 }
 
 auto
@@ -158,11 +159,33 @@ launch_scatter(const Gpu& gpu,
                const void* stage_region,
                void* field_base,
                const PackKernelArgs& a) -> gpu_error_t {
-  PackStep step;
-  step.args = a;
-  step.stage_offset = 0U;
-  return launch_scatter_batch(gpu, stream, elem_bytes, stage_region, field_base,
-                              make_pack_batch(&step, 1U));
+  return dispatch_width(elem_bytes, [&](auto w) {
+    return scatter_step_as<decltype(w)>(gpu, stream, stage_region, field_base, a);
+  });
+}
+
+auto
+launch_gather_table(const Gpu& gpu,
+                    gpu_stream_t stream,
+                    std::size_t elem_bytes,
+                    const void* field_base,
+                    void* stage_base,
+                    const PackTable& table) -> gpu_error_t {
+  return dispatch_width(elem_bytes, [&](auto w) {
+    return gather_table_as<decltype(w)>(gpu, stream, field_base, stage_base, table);
+  });
+}
+
+auto
+launch_scatter_table(const Gpu& gpu,
+                     gpu_stream_t stream,
+                     std::size_t elem_bytes,
+                     const void* stage_base,
+                     void* field_base,
+                     const PackTable& table) -> gpu_error_t {
+  return dispatch_width(elem_bytes, [&](auto w) {
+    return scatter_table_as<decltype(w)>(gpu, stream, stage_base, field_base, table);
+  });
 }
 
 }  // namespace carbon::detail::halo_pack

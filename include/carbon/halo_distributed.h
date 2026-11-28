@@ -9,6 +9,7 @@
 #include <carbon/detail/halo_build.h>
 #include <carbon/detail/halo_distributed_build.h>
 #include <carbon/detail/halo_pack.h>
+#include <carbon/detail/kernel_impl.h>
 #include <carbon/dist_message.h>
 #include <carbon/logging.h>
 #include <carbon/stencil.h>
@@ -23,7 +24,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -241,26 +245,95 @@ public:
     std::vector<DistMessage> out;
 #ifdef CARBON_HAVE_MPI_NCCL
     size_t group = 0;
-    const auto add = [&out, &group](const DistTransfer<T>& d) {
-      const size_t before = out.size();
-      d.append_messages(out, group);
-      if (out.size() > before) {
-        ++group;
-      }
-    };
     if (axis_passes_.empty()) {
-      add(dist_);
+      append_group_(dist_, out, group);
       return out;
     }
-    for (const AxisPass& pass : axis_passes_) {
-      add(pass.dist);
-#if CARBON_BACKEND_IS_CUDALIKE
-      add(pass.dist_staged);
-#endif
+    for (size_t i = 0; i < axis_passes_.size(); ++i) {
+      append_pass_messages_(i, out, group);
     }
 #endif
     return out;
   }
+
+  /** One phase of a staged axis pass (see @ref launch_phase ). */
+  enum class Phase : std::uint8_t {
+    Gather = 0,    ///< packed gather kernels (field -> staging buffer)
+    Exchange = 1,  ///< intra copies, then the pass's NCCL groups
+    Scatter = 2,   ///< packed scatter kernels (staging buffer -> field halo)
+  };
+
+  /** Number of staged axis passes (0 for the legacy Slab path). */
+  [[nodiscard]] auto
+  num_passes() const noexcept -> size_t {
+    return axis_passes_.size();
+  }
+
+  /**
+   * Issue one phase of axis pass @p pass on @p stream. @ref operator() runs Gather, Exchange and
+   * Scatter of every pass in order (plus the cross-GPU fences); an expanded kernel graph (see
+   * @ref kernel_graph ) runs each phase as its own @c Skeleton node.
+   */
+  auto
+  launch_phase(size_t pass,
+               Phase phase,
+               const Stream& stream) const -> void {
+    const AxisPass& p = axis_passes_[pass];
+    switch (phase) {
+      case Phase::Gather:
+#if CARBON_BACKEND_IS_CUDALIKE
+        run_pack_table_(p.gather_table, stream, /*gather=*/true);
+#endif
+        break;
+      case Phase::Exchange:
+        p.intra(stream);
+#ifdef CARBON_HAVE_MPI_NCCL
+        p.dist(stream);
+#if CARBON_BACKEND_IS_CUDALIKE
+        p.dist_staged(stream);
+#endif
+#endif
+        break;
+      case Phase::Scatter:
+#if CARBON_BACKEND_IS_CUDALIKE
+        run_pack_table_(p.scatter_table, stream, /*gather=*/false);
+#endif
+        break;
+    }
+  }
+
+  /**
+   * The messages of axis pass @p pass , numbered with the same @c DistMessage::group values as
+   * @ref dist_messages .
+   */
+  [[nodiscard]] auto
+  dist_messages_of_pass(size_t pass) const -> std::vector<DistMessage> {
+    std::vector<DistMessage> out;
+#ifdef CARBON_HAVE_MPI_NCCL
+    size_t group = 0;
+    std::vector<DistMessage> earlier;
+    for (size_t i = 0; i < pass; ++i) {
+      append_pass_messages_(i, earlier, group);
+    }
+    append_pass_messages_(pass, out, group);
+#else
+    (void)pass;
+#endif
+    return out;
+  }
+
+  /**
+   * The exchange as a graph of @c Skeleton nodes: Gather -> Exchange -> Scatter per axis pass,
+   * passes in order (a pass reads the halo cells the previous one wrote). Every pass has all three
+   * nodes on every rank, so the graph shape is rank-independent; an empty phase is a no-op launch.
+   *
+   * Returns @c std::nullopt (stay one node) unless the exchange needs no cross-GPU fence: one
+   * local GPU, no intra-process copies and no pass barrier, i.e. the packed path of a
+   * one-rank-per-GPU run. @p self owns the kernel impl holding this descriptor.
+   */
+  [[nodiscard]] auto
+  kernel_graph(const std::shared_ptr<detail::KernelImpl>& self,
+               const std::string& name) const -> std::optional<detail::KernelGraph>;
 
   /**
    * Issue the halo updates on @p stream. Dispatches the precomputed intra-process
@@ -289,22 +362,12 @@ public:
       for (size_t i = 0; i < axis_passes_.size(); ++i) {
         const AxisPass& pass = axis_passes_[i];
 
-        // Packed X/Y faces: gather -> [intra] -> one NCCL message per side -> scatter, all on
+        // Packed faces: gather -> [intra] -> one NCCL message per side -> scatter, all on
         // `stream`, so ordinary stream order (not a host barrier) sequences gather < comm < scatter
-        // and this pass < the next pass. Empty for Z passes and for run-based fallbacks.
-#if CARBON_BACKEND_IS_CUDALIKE
-        run_pack_steps_(pass.gathers, stream, /*gather=*/true);
-#endif
-        pass.intra(stream);
-#ifdef CARBON_HAVE_MPI_NCCL
-        pass.dist(stream);
-#if CARBON_BACKEND_IS_CUDALIKE
-        pass.dist_staged(stream);
-#endif
-#endif
-#if CARBON_BACKEND_IS_CUDALIKE
-        run_pack_steps_(pass.scatters, stream, /*gather=*/false);
-#endif
+        // and this pass < the next pass.
+        launch_phase(i, Phase::Gather, stream);
+        launch_phase(i, Phase::Exchange, stream);
+        launch_phase(i, Phase::Scatter, stream);
 
         if (i + 1U < axis_passes_.size()) {
           if (!pass.fence_event.empty()) {
@@ -468,6 +531,7 @@ private:
 
   struct AxisPass {
     Axis axis{Axis::X};
+    bool direct{false};  ///< the single Pencil Direct pass (HaloExchangeMode::Direct)
     Transfer<T> intra{};
 #ifdef CARBON_HAVE_MPI_NCCL
     DistTransfer<T> dist{};
@@ -479,6 +543,9 @@ private:
     std::vector<detail::halo_pack::PackStep> gathers{};
     std::vector<detail::halo_pack::PackStep> scatters{};
     std::vector<detail::halo_pack::PackMsg> staged_msgs{};
+    // Device views of gathers / scatters inside HaloDistributed::pack_tables_ (empty when no steps).
+    detail::halo_pack::PackTable gather_table{};
+    detail::halo_pack::PackTable scatter_table{};
 #ifdef CARBON_HAVE_MPI_NCCL
     DistTransfer<T> dist_staged{};  ///< bound to HaloDistributed::stage_, not to the field buffer
 #endif
@@ -488,39 +555,111 @@ private:
   auto
   build_multi_axis_() -> void;
 
+#ifdef CARBON_HAVE_MPI_NCCL
+  /** Append @p d 's messages tagged with @p group ; a non-empty transfer consumes one group. */
+  static auto
+  append_group_(const DistTransfer<T>& d,
+                std::vector<DistMessage>& out,
+                size_t& group) -> void {
+    const size_t before = out.size();
+    d.append_messages(out, group);
+    if (out.size() > before) {
+      ++group;
+    }
+  }
+
+  auto
+  append_pass_messages_(size_t pass,
+                        std::vector<DistMessage>& out,
+                        size_t& group) const -> void {
+    append_group_(axis_passes_[pass].dist, out, group);
+#if CARBON_BACKEND_IS_CUDALIKE
+    append_group_(axis_passes_[pass].dist_staged, out, group);
+#endif
+  }
+#endif
+
+  /** True when every pass can run as separate Skeleton nodes (see @ref kernel_graph ). */
+  [[nodiscard]] auto
+  expandable_() const noexcept -> bool {
+#if CARBON_BACKEND_IS_CUDALIKE
+    if (axis_passes_.empty() || !fence_event_.empty() || !drain_event_.empty() || pass_barrier_) {
+      return false;
+    }
+    return std::all_of(axis_passes_.begin(), axis_passes_.end(), [](const AxisPass& p) {
+      return p.fence_event.empty() && p.intra.src_counts().empty();
+    });
+#else
+    return false;
+#endif
+  }
+
 #if CARBON_BACKEND_IS_CUDALIKE
   /**
-   * Launch gather (or scatter) kernels of one pass on @p stream. Consecutive steps are fused into
-   * one @ref detail::halo_pack::PackBatch launch (up to @c kMaxPackBatchSteps at a time) so a
-   * typical two-sided axis pass is a single kernel.
+   * Launch the gather (or scatter) of one pass on @p stream: every step of the pass is one
+   * @ref detail::halo_pack::PackTable launch, so each phase of a pass is a single kernel.
    */
   auto
-  run_pack_steps_(const std::vector<detail::halo_pack::PackStep>& steps,
+  run_pack_table_(const detail::halo_pack::PackTable& table,
                   const Stream& stream,
                   bool gather) const -> void {
-    if (steps.empty()) {
+    if (table.num_steps == 0U) {
       return;
     }
     const detail::Gpu& gpu = field_.dense().system().gpu_group().devices()[0];
     const detail::gpu_stream_t native = stream.native_at(0);
     T* field_base = field_.gpu_buffers()[0].data();
     T* stage_base = stage_[0].data();
-    for (size_t i = 0; i < steps.size();) {
-      const size_t n =
-          std::min<size_t>(detail::halo_pack::kMaxPackBatchSteps, steps.size() - i);
-      const detail::halo_pack::PackBatch batch =
-          detail::halo_pack::make_pack_batch(steps.data() + i, n);
-      const detail::gpu_error_t err =
-          gather ? detail::halo_pack::launch_gather_batch(gpu, native, sizeof(T), field_base,
-                                                          stage_base, batch)
-                 : detail::halo_pack::launch_scatter_batch(gpu, native, sizeof(T), stage_base,
-                                                           field_base, batch);
-      if (err != detail::gpu_success) {
-        log::throw_with_log<std::runtime_error>(
-            "HaloDistributed packed {} kernel launch failed: {}", gather ? "gather" : "scatter",
-            detail::gpu_error_string(err));
+    const detail::gpu_error_t err =
+        gather ? detail::halo_pack::launch_gather_table(gpu, native, sizeof(T), field_base,
+                                                        stage_base, table)
+               : detail::halo_pack::launch_scatter_table(gpu, native, sizeof(T), stage_base,
+                                                         field_base, table);
+    if (err != detail::gpu_success) {
+      log::throw_with_log<std::runtime_error>("HaloDistributed packed {} kernel launch failed: {}",
+                                              gather ? "gather" : "scatter",
+                                              detail::gpu_error_string(err));
+    }
+  }
+
+  /**
+   * Serialize every pass's gather and scatter steps into one image, upload it to
+   * @c pack_tables_ (blocking, constructor only) and point each pass's tables into it.
+   */
+  auto
+  upload_pack_tables_(const System& sys) -> void {
+    struct Placed {
+      AxisPass* pass;
+      bool gather;
+      size_t at;
+      detail::halo_pack::PackTableImage image;
+    };
+    std::vector<std::byte> bytes;
+    std::vector<Placed> placed;
+    for (AxisPass& pass : axis_passes_) {
+      for (const bool gather : {true, false}) {
+        const auto& steps = gather ? pass.gathers : pass.scatters;
+        if (steps.empty()) {
+          continue;
+        }
+        detail::halo_pack::PackTableImage image = detail::halo_pack::make_pack_table_image(steps);
+        const size_t at = bytes.size();
+        bytes.insert(bytes.end(), image.bytes.begin(), image.bytes.end());
+        placed.push_back(Placed{&pass, gather, at, std::move(image)});
       }
-      i += n;
+    }
+    if (bytes.empty()) {
+      return;
+    }
+    pack_tables_ = sys.template buffer<std::byte>(std::vector<size_t>{bytes.size()});
+    const Stream stream = sys.default_stream();
+    sys.async_copy(detail::Allocation<std::byte>::unmanaged(detail::AllocationLocation::Cpu,
+                                                            bytes.data(), bytes.size(), -1, -1),
+                   pack_tables_[0], bytes.size(), stream);
+    stream.wait();
+    const std::byte* base = pack_tables_[0].data();
+    for (const Placed& p : placed) {
+      (p.gather ? p.pass->gather_table : p.pass->scatter_table) = p.image.view(base + p.at);
     }
   }
 #endif
@@ -544,6 +683,9 @@ private:
   // One contiguous staging buffer shared by every packed pass (single local GPU only). Allocated
   // in the constructor so no allocation can land inside graph capture or a timed region.
   Buffer<T> stage_{};
+  // Step tables of every packed pass (one PackTableImage per pass and phase), uploaded once in the
+  // constructor; AxisPass::gather_table / scatter_table point into it.
+  Buffer<std::byte> pack_tables_{};
 #endif
   // See operator(): host barrier between axis passes. CARBON_HALO_PASS_BARRIER=1 enables it.
   bool pass_barrier_{false};
@@ -932,7 +1074,21 @@ HaloDistributed<T,
   const bool pack_z =
       pack_ok && Components > 1 && detail::halo_pack::env_flag("CARBON_HALO_PACK_Z", true);
   size_t stage_total = 0;
+  // HaloExchangeMode::Direct: Pencil faces and YZ edges go straight to all eight neighbours, Brick
+  // faces, edges and corners to all 26, in one packed pass. The axis loop below then only records
+  // the host-side entries (launch_on_host keeps its staged copies); the device work is the single
+  // direct pass.
+  const int64_3d span_halo = spans[0].halo();
+  const bool direct_mode = pack_ok && dense.halo_exchange() == HaloExchangeMode::Direct;
+  const bool direct_pencil = direct_mode && span_halo.x == 0 && span_halo.y > 0 && span_halo.z > 0;
+  const bool direct_brick = direct_mode && span_halo.x > 0;
+  const bool direct = direct_pencil || direct_brick;
+#else
+  constexpr bool direct = false;
 #endif
+  AxisPass direct_pass;
+  direct_pass.axis = Axis::Y;
+  direct_pass.direct = true;
 
 #ifdef CARBON_HAVE_MPI_NCCL
   struct DistEntry {
@@ -957,7 +1113,9 @@ HaloDistributed<T,
     bool pack_axis = false;
 #if CARBON_BACKEND_IS_CUDALIKE
     detail::halo_pack::AxisPackPlan pack_plan;
-    if (pack_ok && (axis == Axis::X || axis == Axis::Y || (axis == Axis::Z && pack_z))) {
+    if (direct) {
+      pack_axis = true;  // device side carried by direct_pass
+    } else if (pack_ok && (axis == Axis::X || axis == Axis::Y || (axis == Axis::Z && pack_z))) {
       pack_axis = true;
       const int32_3d pcoords = distributed ? pg.coords_of(world_rank) : pg.coords_of(0);
       const int32_t prank = distributed ? world_rank : 0;
@@ -1133,6 +1291,12 @@ HaloDistributed<T,
       pass.fence_event = sys.event();
     }
 
+    if (direct) {
+      direct_pass.host_intra.insert(direct_pass.host_intra.end(), pass.host_intra.begin(),
+                                    pass.host_intra.end());
+      continue;
+    }
+
 #if CARBON_BACKEND_IS_CUDALIKE
     if (pack_axis) {
       pass.gathers = std::move(pack_plan.gathers);
@@ -1143,6 +1307,52 @@ HaloDistributed<T,
 
     axis_passes_.push_back(std::move(pass));
   }
+
+#if CARBON_BACKEND_IS_CUDALIKE
+  if (direct) {
+    const auto crosses = [bidirectional](int32_t sign, int64_t v) noexcept -> bool {
+      if (sign == 0) {
+        return true;
+      }
+      if (bidirectional) {
+        return v != 0;
+      }
+      return sign > 0 ? v > 0 : v < 0;
+    };
+    const auto direct_send = [&](int c, int32_t dx, int32_t dy, int32_t dz) -> bool {
+      if (semantic_ == StencilSemantic::Standard) {
+        return true;
+      }
+      return crosses(dx, velocity(c, Axis::X)) && crosses(dy, velocity(c, Axis::Y)) &&
+             crosses(dz, velocity(c, Axis::Z));
+    };
+    const auto direct_recv = [&](int c, int32_t dx, int32_t dy, int32_t dz) -> bool {
+      return direct_send(c, -dx, -dy, -dz);
+    };
+    const int32_3d pcoords = distributed ? pg.coords_of(world_rank) : pg.coords_of(0);
+    const int32_t prank = distributed ? world_rank : 0;
+    const AxisGeometry geom = geom_of(spans[0]);
+    const auto comp_stride = static_cast<int64_t>(spans[0].linear_storage_elements());
+    detail::halo_pack::AxisPackPlan plan =
+        direct_brick ? detail::halo_pack::build_brick_direct_pack_plan(
+                           pg, dense.boundary_mode(), pcoords, prank, geom, Components, comp_stride,
+                           direct_send, direct_recv, stage_total)
+                     : detail::halo_pack::build_pencil_direct_pack_plan(
+                           pg, dense.boundary_mode(), pcoords, prank, geom, Components, comp_stride,
+                           [&](int c, int32_t dy, int32_t dz) {
+                             return direct_send(c, 0, dy, dz);
+                           },
+                           [&](int c, int32_t dy, int32_t dz) {
+                             return direct_recv(c, 0, dy, dz);
+                           },
+                           stage_total);
+    stage_total += plan.stage_elems;
+    direct_pass.gathers = std::move(plan.gathers);
+    direct_pass.scatters = std::move(plan.scatters);
+    direct_pass.staged_msgs = std::move(plan.msgs);
+    axis_passes_.push_back(std::move(direct_pass));
+  }
+#endif
 
   for (const AxisPass& pass : axis_passes_) {
     if (!pass.intra.src_counts().empty()) {
@@ -1172,8 +1382,115 @@ HaloDistributed<T,
       pass.dist_staged = staged.finalise(dense.system(), stage_);
     }
 #endif
+    upload_pack_tables_(dense.system());
   }
 #endif
+}
+
+namespace detail {
+
+/**
+ * One phase of one axis pass of a @ref HaloDistributed , as a @c Skeleton node of the halo's
+ * expanded kernel graph (see @ref HaloDistributed::kernel_graph ). Keeps the parent halo kernel
+ * alive and carries its conservative field token.
+ */
+template <typename T, int Components>
+class HaloDistributedPhaseKernelImpl final : public KernelImpl {
+public:
+  using Halo = ::carbon::HaloDistributed<T, Components>;
+
+  HaloDistributedPhaseKernelImpl(std::shared_ptr<KernelImpl> parent,
+                                 const Halo* halo,
+                                 size_t pass,
+                                 typename Halo::Phase phase,
+                                 std::string name)
+      : KernelImpl(std::move(name)),
+        parent_(std::move(parent)),
+        halo_(halo),
+        pass_(pass),
+        phase_(phase),
+        tokens_(parent_->tokens()) {}
+
+  auto
+  launch(const ::carbon::Stream& stream,
+         DataView view) -> void override {
+    launch_on_device(stream, view);
+  }
+
+  auto
+  launch_on_device(const ::carbon::Stream& stream,
+                   DataView /*view*/) -> void override {
+    halo_->launch_phase(pass_, phase_, stream);
+  }
+
+  [[nodiscard]] auto
+  runs_on_device() const noexcept -> bool override {
+    return true;
+  }
+
+  [[nodiscard]] auto
+  kind() const noexcept -> KernelKind override {
+    return KernelKind::Halo;
+  }
+
+  [[nodiscard]] auto
+  tokens() const noexcept -> const std::vector<AccessToken>& override {
+    return tokens_;
+  }
+
+  [[nodiscard]] auto
+  communicates() const noexcept -> bool override {
+    return phase_ == Halo::Phase::Exchange;
+  }
+
+  [[nodiscard]] auto
+  dist_messages() const -> std::vector<DistMessage> override {
+    if (phase_ != Halo::Phase::Exchange) {
+      return {};
+    }
+    return halo_->dist_messages_of_pass(pass_);
+  }
+
+private:
+  std::shared_ptr<KernelImpl> parent_;
+  const Halo* halo_;
+  size_t pass_;
+  typename Halo::Phase phase_;
+  std::vector<AccessToken> tokens_;
+};
+
+}  // namespace detail
+
+template <typename T,
+          int Components>
+auto
+HaloDistributed<T,
+                Components>::kernel_graph(const std::shared_ptr<detail::KernelImpl>& self,
+                                          const std::string& name) const
+    -> std::optional<detail::KernelGraph> {
+  if (!expandable_()) {
+    return std::nullopt;
+  }
+  constexpr const char* kPhaseNames[] = {"gather", "exchange", "scatter"};
+  detail::KernelGraph graph;
+  size_t prev = detail::KernelGraph::kHead;
+  for (size_t i = 0; i < axis_passes_.size(); ++i) {
+    const AxisPass& pass = axis_passes_[i];
+    const char* label = pass.direct            ? "direct"
+                        : pass.axis == Axis::X ? "x"
+                        : pass.axis == Axis::Y ? "y"
+                                               : "z";
+    for (const Phase phase : {Phase::Gather, Phase::Exchange, Phase::Scatter}) {
+      const size_t id =
+          graph.add(std::make_shared<detail::HaloDistributedPhaseKernelImpl<T, Components>>(
+              self, this, i, phase,
+              name + "/" + label + "." + kPhaseNames[static_cast<size_t>(phase)]));
+      graph.edge(prev, id);
+      prev = id;
+    }
+  }
+  graph.edge(prev, detail::KernelGraph::kTail);
+  return graph;
 }
 
 /**

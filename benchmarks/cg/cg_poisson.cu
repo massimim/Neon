@@ -82,6 +82,15 @@
 //                                splits z as 1x1xP, pencil splits the two
 //                                most-square factors, brick picks the factor
 //                                triple of P with the smallest max/min ratio.
+//   --halo-exchange {staged|direct}
+//                                Halo exchange of --grid dense_distributed:
+//                                staged (default) or direct (pencil and brick:
+//                                one packed pass with edge / corner peers).
+//   --hp-halo                    Halo steps on high-priority streams.
+//   --reps N                     Split the timed iterations (max_iter - warmup)
+//                                into N equal repetitions (default 1).
+//   --report path                Write a carbon-cg-report-v1 JSON (rank 0).
+//   --label text                 Free-form label stored in the report.
 //   --dot                        Dump the inferred main-loop DAGs as GraphViz
 //                                DOT on stdout (one block per Skeleton).
 //   --dot-out prefix             Write launch-matrix DOT + launch-order listings
@@ -130,13 +139,18 @@
 
 #include <clipp.h>
 
+#include "bench_report.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <numeric>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -316,6 +330,11 @@ struct Options {
   bool dot_matrix = false;
   std::string vtk_path = "";      // NEW
   bool profile_steps = false;
+  std::string halo_exchange = "staged";
+  bool hp_halo = false;
+  int64_t reps = 1;
+  std::string report_path;
+  std::string label;
 };
 
 // Build a clipp parser bound directly to @p opts. Mirrors the structure of the
@@ -367,7 +386,17 @@ build_cli(Options& opts) -> clipp::group {
           "legacy STRUCTURED_POINTS file at PATH (appends .rankN under MPI; "
           "Dense and DenseDistributed only). Off by default.",
       (option("--decomposition") & value("mode", opts.dec)) %
-          "MPI decomposition: slab | pencil | brick (default: slab, only relevant for distributed runs)";
+          "MPI decomposition: slab | pencil | brick (default: slab, only relevant for distributed runs)",
+      (option("--halo-exchange") & value("staged|direct", opts.halo_exchange)) %
+          "Halo exchange of --grid dense_distributed: staged (default) | direct (pencil and "
+          "brick: one packed pass with edge / corner peers; slab stays staged)",
+      (option("--hp-halo").set(opts.hp_halo) %
+       "Run halo steps on high-priority streams (useful with --overlap standard)"),
+      (option("--reps") & integer("reps", opts.reps)) %
+          "Split the timed iterations (max_iter - warmup) into N equal repetitions (default 1)",
+      (option("--report") & value("path", opts.report_path)) %
+          "Write a carbon-cg-report-v1 JSON report to PATH (rank 0)",
+      (option("--label") & value("text", opts.label)) % "Free-form label stored in the report";
 
 }
 
@@ -398,6 +427,12 @@ parse_cli(int argc,
   }
   if (opts.warmup > opts.max_iter) {
     opts.warmup = opts.max_iter;
+  }
+  const auto timed = static_cast<int64_t>(opts.max_iter - opts.warmup);
+  if (opts.reps < 1 || timed % opts.reps != 0) {
+    std::cerr << "cg_poisson_unified: --reps must be >= 1 and divide the " << timed
+              << " timed iterations (max_iter - warmup; got " << opts.reps << ")\n";
+    return false;
   }
   return true;
 }
@@ -849,6 +884,155 @@ build_gradient(const Grid& grid,
       std::move(name));
 }
 
+// Run setup recorded in the --report JSON.
+struct RunContext {
+  int world_size = 1;
+  int world_rank = 0;
+  std::string decomposition = "n/a";
+  std::optional<carbon::int32_3d> process_grid;
+};
+
+// CG outcome and per-iteration wall times (ms, warmup excluded) for the --report JSON.
+struct CgResults {
+  size_t iterations = 0;
+  bool converged = false;
+  double r0_norm = 0.0;
+  double final_r_norm = 0.0;
+  std::vector<double> iteration_ms;
+};
+
+// Throughput is in MDOF/s: domain cells x timed iterations / timed seconds / 1e6 (every
+// iteration does one matvec and the vector updates over every cell). Repetition i covers timed
+// iterations [i * k, (i + 1) * k), k = (max_iter - warmup) / reps; a run that converged early
+// keeps only its complete repetitions.
+[[nodiscard]] auto
+write_cg_report(const Options& opts,
+                const RunContext& ctx,
+                const carbon::System& sys,
+                std::string_view overlap,
+                const CgResults& res) -> bool {
+  using carbon::bench::json_escape;
+  if (res.iteration_ms.empty()) {
+    CARBON_LOG_ERROR("cg_poisson_unified: no timed iterations, not writing --report '{}'",
+                     opts.report_path);
+    return false;
+  }
+  const double cells = static_cast<double>(opts.nx) * static_cast<double>(opts.ny) *
+                       static_cast<double>(opts.nz);
+  const size_t local_gpus = sys.gpu_group().size();
+  const size_t gpu_count = static_cast<size_t>(ctx.world_size) * local_gpus;
+  const double timing_seconds =
+      std::accumulate(res.iteration_ms.begin(), res.iteration_ms.end(), 0.0) / 1.0e3;
+  const auto timed = static_cast<double>(res.iteration_ms.size());
+  const double mdofs = cells * timed / timing_seconds / 1.0e6;
+  const SampleStats stats = compute_sample_stats(res.iteration_ms);
+
+  const size_t iters_per_rep = (opts.max_iter - opts.warmup) / static_cast<size_t>(opts.reps);
+  std::vector<double> rep_seconds;
+  std::vector<double> rep_mdofs;
+  std::vector<double> rep_median_ms;
+  for (size_t begin = 0; iters_per_rep > 0U && begin + iters_per_rep <= res.iteration_ms.size();
+       begin += iters_per_rep) {
+    const std::vector<double> rep(res.iteration_ms.begin() + static_cast<std::ptrdiff_t>(begin),
+                                  res.iteration_ms.begin() +
+                                      static_cast<std::ptrdiff_t>(begin + iters_per_rep));
+    const double seconds = std::accumulate(rep.begin(), rep.end(), 0.0) / 1.0e3;
+    rep_seconds.push_back(seconds);
+    rep_mdofs.push_back(cells * static_cast<double>(iters_per_rep) / seconds / 1.0e6);
+    rep_median_ms.push_back(compute_sample_stats(rep).median);
+  }
+  const auto write_list = [](std::ostream& out, const std::vector<double>& v) {
+    out << "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+      out << (i == 0 ? "" : ", ") << v[i];
+    }
+    out << "]";
+  };
+
+  std::ofstream out(opts.report_path);
+  if (!out.is_open()) {
+    CARBON_LOG_ERROR("cg_poisson_unified: failed to open --report path '{}'", opts.report_path);
+    return false;
+  }
+  out << std::setprecision(10);
+  out << "{\n";
+  out << "  \"schema\": \"carbon-cg-report-v1\",\n";
+  out << "  \"benchmark\": \"cg_poisson\",\n";
+  out << "  \"timestamp_utc\": \"" << carbon::bench::utc_timestamp_now() << "\",\n";
+  out << "  \"config\": {\n";
+  out << "    \"nx\": " << opts.nx << ",\n";
+  out << "    \"ny\": " << opts.ny << ",\n";
+  out << "    \"nz\": " << opts.nz << ",\n";
+  out << "    \"max_iter\": " << opts.max_iter << ",\n";
+  out << "    \"warmup\": " << opts.warmup << ",\n";
+  out << "    \"reps\": " << opts.reps << ",\n";
+  out << "    \"tol_rel\": " << opts.tol_rel << ",\n";
+  out << "    \"tol_abs\": " << opts.tol_abs << ",\n";
+  out << "    \"grid\": \"" << json_escape(opts.grid_kind) << "\",\n";
+  out << "    \"decomposition\": \"" << json_escape(ctx.decomposition) << "\",\n";
+  out << "    \"halo_exchange\": \"" << json_escape(opts.halo_exchange) << "\",\n";
+  if (ctx.process_grid) {
+    const carbon::int32_3d d = *ctx.process_grid;
+    out << "    \"process_grid\": [" << d.x << ", " << d.y << ", " << d.z << "],\n";
+  } else {
+    out << "    \"process_grid\": null,\n";
+  }
+  out << "    \"overlap\": \"" << json_escape(std::string(overlap)) << "\",\n";
+  out << "    \"hp_halo\": " << (opts.hp_halo ? "true" : "false") << ",\n";
+  out << "    \"label\": \"" << json_escape(opts.label) << "\"\n";
+  out << "  },\n";
+  out << "  \"system\": {\n";
+  out << "    \"backend\": \"" << CARBON_BACKEND_NAME << "\",\n";
+  out << "    \"distributed\": " << (ctx.world_size > 1 ? "true" : "false") << ",\n";
+  out << "    \"gpu_count\": " << gpu_count << ",\n";
+  out << "    \"local_gpu_count\": " << local_gpus << ",\n";
+  out << "    \"world_size\": " << ctx.world_size << ",\n";
+  out << "    \"gpus\": [\n";
+  const auto& devices = sys.gpu_group().devices();
+  for (size_t i = 0; i < devices.size(); ++i) {
+    const auto& props = devices[i].properties();
+    out << "      {\"device_id\": " << devices[i].device_id() << ", \"name\": \""
+        << json_escape(props.name) << "\", \"compute_capability\": \"" << props.compute_major
+        << "." << props.compute_minor << "\"}" << (i + 1 == devices.size() ? "" : ",") << "\n";
+  }
+  out << "    ]\n";
+  out << "  },\n";
+  out << "  \"results\": {\n";
+  out << "    \"iterations\": " << res.iterations << ",\n";
+  out << "    \"converged\": " << (res.converged ? "true" : "false") << ",\n";
+  out << std::setprecision(17);
+  out << "    \"r0_norm\": " << res.r0_norm << ",\n";
+  out << "    \"final_residual\": " << res.final_r_norm << ",\n";
+  out << std::setprecision(10);
+  out << "    \"timed_iters\": " << res.iteration_ms.size() << ",\n";
+  out << "    \"timing_seconds\": " << timing_seconds << ",\n";
+  out << "    \"cells\": " << static_cast<int64_t>(cells) << ",\n";
+  out << "    \"mdofs\": " << mdofs << ",\n";
+  out << "    \"mdofs_per_gpu\": " << mdofs / static_cast<double>(gpu_count) << ",\n";
+  out << "    \"iteration_ms\": {\"median\": " << stats.median << ", \"mean\": " << stats.mean
+      << ", \"min\": " << stats.min << ", \"max\": " << stats.max << ", \"stddev\": "
+      << stats.stddev << "},\n";
+  out << "    \"repetitions\": {\n";
+  out << "      \"count\": " << rep_seconds.size() << ",\n";
+  out << "      \"iters_per_rep\": " << iters_per_rep << ",\n";
+  out << "      \"seconds\": ";
+  write_list(out, rep_seconds);
+  out << ",\n      \"mdofs\": ";
+  write_list(out, rep_mdofs);
+  out << ",\n      \"median_ms\": ";
+  write_list(out, rep_median_ms);
+  out << "\n    }\n";
+  out << "  }\n";
+  out << "}\n";
+  out.close();
+  if (out.fail()) {
+    CARBON_LOG_ERROR("cg_poisson_unified: failed to write --report path '{}'", opts.report_path);
+    return false;
+  }
+  CARBON_LOG_INFO("cg_poisson_unified: wrote JSON report to {}", opts.report_path);
+  return true;
+}
+
 // ---- Solver ----
 
 template <typename Grid>
@@ -857,8 +1041,9 @@ run_cg(Grid& grid,
        carbon::System& sys,
        const Options& opts,
        std::string_view grid_tag,
-       int world_rank) -> int {
+       const RunContext& ctx) -> int {
   using Field = typename Grid::template Field<double, 1>;
+  const int world_rank = ctx.world_rank;
 
   Field u = grid.template newField<double, 1>(carbon::MemorySide::Device, "u");
   Field b = grid.template newField<double, 1>(carbon::MemorySide::Device, "b");
@@ -907,13 +1092,15 @@ run_cg(Grid& grid,
   }
   const carbon::OverlapMode overlap_mode = *overlap_opt;
 
-  carbon::Skeleton iter_pre(sys, carbon::Skeleton::Options{overlap_mode});
+  const carbon::Skeleton::Options iter_opts(
+      overlap_mode, opts.hp_halo ? carbon::StreamPriority::High : carbon::StreamPriority::Normal);
+  carbon::Skeleton iter_pre(sys, iter_opts);
   iter_pre.add(build_update_p(grid, p, r, beta_host, "p:=r+beta*p"));
   iter_pre.add(build_matvec(grid, p, s_field, invh2, "s:=Ap"));
   iter_pre.add(build_reduce_pAp(grid, p, s_field, pAp, "pAp:=<p,s>"));
   iter_pre.compile();
 
-  carbon::Skeleton iter_post(sys, carbon::Skeleton::Options{overlap_mode});
+  carbon::Skeleton iter_post(sys, iter_opts);
   iter_post.add(build_update_x_r(grid, u, r, p, s_field, alpha_host, "x+=ap;r-=as"));
   iter_post.add(build_reduce_rTr(grid, r, delta_new, "delta:=<r,r>"));
   iter_post.compile();
@@ -921,10 +1108,10 @@ run_cg(Grid& grid,
   if (world_rank == 0) {
     CARBON_LOG_INFO(
         "cg_poisson_unified[{}]: init.kernels={}/{} iter_pre.kernels={}/{} iter_post.kernels={}/{} "
-        "overlap={}",
+        "overlap={} hp_halo={}",
         grid_tag, init.size(), init.effective_kernels().size(), iter_pre.size(),
         iter_pre.effective_kernels().size(), iter_post.size(), iter_post.effective_kernels().size(),
-        overlap_mode_name(overlap_mode));
+        overlap_mode_name(overlap_mode), opts.hp_halo);
     if (opts.dump_dot) {
       CARBON_LOG_INFO("cg_poisson_unified[{}]: --- init DAG ---\n{}", grid_tag,
                       init.export_dot("cg_init"));
@@ -1067,6 +1254,23 @@ run_cg(Grid& grid,
           "mean={:.3f} std={:.3f} median={:.3f}",
           grid_tag, stats.n, opts.warmup, stats.min, stats.max, stats.mean, stats.stddev,
           stats.median);
+      const double total_ms = std::accumulate(iteration_ms.begin(), iteration_ms.end(), 0.0);
+      const double mdofs = static_cast<double>(opts.nx) * static_cast<double>(opts.ny) *
+                           static_cast<double>(opts.nz) * static_cast<double>(stats.n) /
+                           (total_ms * 1.0e3);
+      std::cout << "MDOFS=" << mdofs << " ITER_MS=" << stats.median << std::endl;
+    }
+
+    if (!opts.report_path.empty()) {
+      CgResults res;
+      res.iterations = iter;
+      res.converged = converged;
+      res.r0_norm = r0_norm;
+      res.final_r_norm = final_r_norm;
+      res.iteration_ms = iteration_ms;
+      if (!write_cg_report(opts, ctx, sys, overlap_mode_name(overlap_mode), res)) {
+        return EXIT_FAILURE;
+      }
     }
 
     if (opts.profile_steps) {
@@ -1144,10 +1348,12 @@ run_cg(Grid& grid,
   }
   // ---- end VTK dump -----------------------------------------------------
 
-  if (iter == opts.max_iter && world_rank == 0) {
-      CARBON_LOG_INFO("cg_poisson_unified[{}]: halted at max_iter={}, convergence status: {}", 
+  if (iter == opts.max_iter) {
+    if (world_rank == 0) {
+      CARBON_LOG_INFO("cg_poisson_unified[{}]: halted at max_iter={}, convergence status: {}",
                       grid_tag, opts.max_iter, converged);
-      return EXIT_SUCCESS;
+    }
+    return EXIT_SUCCESS;
   }
 
   return (final_r_norm <= abs_target) ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -1234,6 +1440,14 @@ main(int argc, char** argv) -> int {
     }
   }
 
+  RunContext ctx;
+  ctx.world_size = world_size;
+  ctx.world_rank = world_rank;
+  ctx.decomposition = is_distributed ? decomposition_mode_name(dec_mode) : "n/a";
+  if (pg) {
+    ctx.process_grid = pg->dims();
+  }
+
   // 6-point face stencil -> halo_z = 1 .
   carbon::Stencil stencil(
       std::vector<carbon::int32_3d>{
@@ -1249,16 +1463,27 @@ main(int argc, char** argv) -> int {
         return EXIT_FAILURE;
       }
       carbon::Dense dense(sys, global, stencil);
-      return run_cg(dense, sys, opts, "dense", world_rank);
+      return run_cg(dense, sys, opts, "dense", ctx);
     }
     if (opts.grid_kind == "dense_distributed") {
+      if (opts.halo_exchange != "staged" && opts.halo_exchange != "direct") {
+        CARBON_LOG_ERROR(
+            "cg_poisson_unified: unknown --halo-exchange '{}' (expected staged|direct)",
+            opts.halo_exchange);
+        return EXIT_FAILURE;
+      }
+      const carbon::HaloExchangeMode halo_exchange = opts.halo_exchange == "direct"
+                                                         ? carbon::HaloExchangeMode::Direct
+                                                         : carbon::HaloExchangeMode::Staged;
       std::optional<carbon::DenseDistributed> dense_distributed;
       if (pg) {
-        dense_distributed.emplace(sys, global, *pg, stencil);
+        dense_distributed.emplace(sys, global, *pg, stencil, carbon::BoundaryModeDistributed::Open,
+                                  carbon::float32_3d{}, 1.0F, std::nullopt, halo_exchange);
       } else {
-        dense_distributed.emplace(sys, global, stencil);
+        dense_distributed.emplace(sys, global, stencil, carbon::BoundaryModeDistributed::Open,
+                                  carbon::float32_3d{}, 1.0F, std::nullopt, halo_exchange);
       }
-      return run_cg(*dense_distributed, sys, opts, "dense_distributed", world_rank);
+      return run_cg(*dense_distributed, sys, opts, "dense_distributed", ctx);
     }
     if (opts.grid_kind == "disg") {
       std::optional<carbon::DenseDisg> disg;
@@ -1269,7 +1494,7 @@ main(int argc, char** argv) -> int {
       // }
       disg.emplace(sys, global, /*halo_z=*/1);
 
-      return run_cg(*disg, sys, opts, "disg", world_rank);
+      return run_cg(*disg, sys, opts, "disg", ctx);
     }
     if (opts.grid_kind == "block") {
       const int64_t nmax = std::max({opts.nx, opts.ny, opts.nz});
@@ -1285,7 +1510,7 @@ main(int argc, char** argv) -> int {
       // }
       block.emplace(sys, global, predicate, "cg_poisson_unified_block");
 
-      return run_cg(*block, sys, opts, "block", world_rank);
+      return run_cg(*block, sys, opts, "block", ctx);
     }
     if (opts.grid_kind == "disg_distributed") {
       std::optional<carbon::DenseDisgDistributed> disg_distributed;
@@ -1296,7 +1521,7 @@ main(int argc, char** argv) -> int {
         // (System, int64_3d, Stencil)
         disg_distributed.emplace(sys, global, stencil);
       }
-      return run_cg(*disg_distributed, sys, opts, "disg_distributed", world_rank);
+      return run_cg(*disg_distributed, sys, opts, "disg_distributed", ctx);
     }
     CARBON_LOG_ERROR(
         "cg_poisson_unified: unknown --grid '{}' (expected dense|dense_distributed|disg|block|disg_distributed)",

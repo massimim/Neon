@@ -39,6 +39,8 @@
 #include <carbon/system.h>
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -166,6 +168,18 @@ public:
       return halo_.dist_messages();
     } else {
       return {};
+    }
+  }
+
+  /** Forwards to @c HaloT::kernel_graph(self, name) when the halo family can expand. */
+  [[nodiscard]] auto
+  expand(const std::shared_ptr<KernelImpl>& self) const -> std::optional<KernelGraph> override {
+    if constexpr (requires(const HaloT& h, const std::shared_ptr<KernelImpl>& p) {
+                    h.kernel_graph(p, std::string{});
+                  }) {
+      return halo_.kernel_graph(self, std::string{name()});
+    } else {
+      return std::nullopt;
     }
   }
 

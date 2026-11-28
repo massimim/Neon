@@ -21,6 +21,7 @@
 #include <carbon/cuda_annotation.h>
 #include <carbon/data_view.h>
 #include <carbon/dense_distributed.h>
+#include <carbon/detail/dense_distributed/brick_boundary.h>
 #include <carbon/detail/dense_distributed/kernel.h>
 #include <carbon/detail/dense_distributed/pencil_boundary.h>
 #include <carbon/detail/dense_distributed/window_launch.h>
@@ -135,9 +136,20 @@ launch_dense_grid(const ::carbon::DenseDistributed& grid,
         to_dim3(shape), dim_block, shared_mem, stream, TypedSpan<StorageKind::Pencil>{span}, fn);
   }
 
+  // Brick Boundary: the six faces in one launch, blockIdx.z = face layer (brick_boundary.h).
+  if (view == ::carbon::DataView::Boundary && uses_brick_boundary_launch(span, block_shape)) {
+    const LaunchShape shape = brick_boundary_grid(brick_boundary_layout(span), block_shape);
+    if (!shape.is_nonzero()) {
+      return gpu_success;
+    }
+    return gpu.template typed_launch<&dense_brick_boundary_kernel<F>>(
+        to_dim3(shape), dim_block, shared_mem, stream, TypedSpan<StorageKind::Brick>{span}, fn);
+  }
+
   // One launch per non-empty window: Standard and Internal are a single box (same launch shape as
-  // the precomputed @p grid_shape); Boundary is up to six boxes (two for a slab). The per-window
-  // shape is derived from the box itself, so @p grid_shape is only used for the early-out above.
+  // the precomputed @p grid_shape); Boundary of a slab is two boxes, and of a pencil or brick
+  // launched with a z > 1 block up to six. The per-window shape is derived from the box itself, so
+  // @p grid_shape is only used for the early-out above.
   const ViewWindowSet windows = span.view_windows(view);
   for (int i = 0; i < windows.count; ++i) {
     const ViewWindow& w = windows.windows[i];

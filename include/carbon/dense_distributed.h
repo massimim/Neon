@@ -45,6 +45,25 @@ class Field;
 }  // namespace detail::dense_distributed
 
 /**
+ * How @ref HaloDistributed fills the halos of a @ref DenseDistributed grid. Fixed at grid
+ * construction.
+ *
+ * - @c Staged (default): one exchange per split axis, in X -> Y -> Z order. Edge and corner halo
+ *   cells travel through the face neighbours of the later passes.
+ * - @c Direct: every halo cell comes straight from the rank that owns it, in one packed pass:
+ *   one gather kernel, one NCCL group with the face and diagonal ranks, one scatter kernel.
+ *   Pencil spans (@c halo.x == 0, @c halo.y and @c halo.z > 0) exchange with up to eight
+ *   neighbours (four faces, four YZ edges); Brick spans (@c halo.x > 0) with up to 26 (six faces,
+ *   twelve edges, eight corners). Lattice stencils skip directions no population crosses (D3Q19
+ *   has no corner populations). Needs the packed path (CUDA/HIP, one local GPU,
+ *   @c CARBON_HALO_PACK on); Slab and unpacked layouts keep @c Staged.
+ */
+enum class HaloExchangeMode : uint8_t {
+  Staged = 0,
+  Direct = 1,
+};
+
+/**
  * Logical Cartesian grid over a (possibly distributed) multi-GPU System: a fixed global
  * @c (x, y, z), partitioned by a @ref ProcessGrid. The local @c DenseDistributed holds one span
  * per local GPU; each span is the chunk of the global domain owned by that GPU.
@@ -122,6 +141,8 @@ public:
    * @param block_override When set, used as the CUDA/SYCL launch block for every local GPU
    *                      instead of @c dense_make_kernel_block(). The matching launch grid
    *                      is derived via @c compute_dense_grid for each @ref DataView.
+   * @param halo_exchange Halo exchange strategy used by @ref HaloDistributed on this grid; see
+   *                      @ref HaloExchangeMode.
    */
   DenseDistributed(System system,
                    int64_3d global_extent,
@@ -129,7 +150,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   HaloExchangeMode halo_exchange = HaloExchangeMode::Staged);
 
   /**
    * @brief Build a layout by auto-factorizing the world size for @p decomposition.
@@ -144,7 +166,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   HaloExchangeMode halo_exchange = HaloExchangeMode::Staged);
 
   /**
    * @brief Build a layout from an explicit @p process_grid.
@@ -159,7 +182,8 @@ public:
                    BoundaryModeDistributed boundary_mode = BoundaryModeDistributed::Open,
                    float32_3d origin = {},
                    float spacing = 1.0F,
-                   std::optional<LaunchShape> block_override = std::nullopt);
+                   std::optional<LaunchShape> block_override = std::nullopt,
+                   HaloExchangeMode halo_exchange = HaloExchangeMode::Staged);
 
   /**
    * @brief Default-construct an empty grid: zero global extent, default
@@ -200,6 +224,10 @@ public:
    */
   [[nodiscard]] auto
   boundary_mode() const noexcept -> BoundaryModeDistributed;
+
+  /** Halo exchange strategy requested at construction (see @ref HaloExchangeMode). */
+  [[nodiscard]] auto
+  halo_exchange() const noexcept -> HaloExchangeMode;
 
   /** Physical-space origin at global cell @c (0,0,0); same value on every @ref spans entry. */
   [[nodiscard]] auto
@@ -319,8 +347,9 @@ public:
    *             @c Span::iter_extent. Defaults to @c DataView::Standard.
    * @return Computed in the constructor from @c spans()[i].iter_extent(view),
    *         @c dense_make_kernel_block(), and each device's @c max_threads_per_block.
-   *         For @c Boundary on a Pencil span (with a @c z == 1 block) it is instead the grid
-   *         of the single four-face launch (see @c pencil_boundary_grid ).
+   *         For @c Boundary on a Pencil or Brick span (with a @c z == 1 block) it is instead
+   *         the grid of the single four- or six-face launch (see @c pencil_boundary_grid and
+   *         @c brick_boundary_grid ).
    *         Returned as @ref LaunchShape so the public API does not depend on any
    *         backend-specific 3D type (the CUDA backend converts to @c dim3 internally;
    *         the future SYCL backend will convert to @c sycl::range<3>).
@@ -566,6 +595,7 @@ private:
   System system_;
   Stencil stencil_{};
   BoundaryModeDistributed boundary_mode_{BoundaryModeDistributed::Open};
+  HaloExchangeMode halo_exchange_{HaloExchangeMode::Staged};
   float32_3d origin_{};
   float spacing_{1.0F};
   // Cross-rank partitioning state. See class doxygen for the model. These are z-coordinate
@@ -592,7 +622,8 @@ private:
                float32_3d origin,
                float spacing,
                ProcessGrid process_grid,
-               std::optional<LaunchShape> block_override);
+               std::optional<LaunchShape> block_override,
+               HaloExchangeMode halo_exchange);
 
   ProcessGrid process_grid_{};
 };

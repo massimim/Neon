@@ -58,7 +58,6 @@ namespace carbon::detail::halo_pack {
 /**
  * Gather @p a 's box of the field (@p field_base, all components addressed through @p a) into the
  * contiguous staging region @p stage_region. Asynchronous on @p stream. Returns the launch error.
- * Implemented as a one-step @ref launch_gather_batch.
  */
 [[nodiscard]] CARBON_API auto
 launch_gather(const Gpu& gpu,
@@ -78,25 +77,27 @@ launch_scatter(const Gpu& gpu,
                const PackKernelArgs& a) -> gpu_error_t;
 
 /**
- * Fused gather: every step in @p batch is covered by one launch (@c blockIdx.z selects step and
- * component). @p stage_base is the staging buffer origin; each step uses @c batch.stage_offsets[i].
+ * Fused gather: every step of @p table is covered by one 1D launch (@ref pack_table_decode maps a
+ * block to its step). The table arrays must be device memory readable from @p gpu for as long as
+ * the launch runs. @p stage_base is the staging buffer origin; step @c s uses
+ * @c table.stage_offsets[s].
  */
 [[nodiscard]] CARBON_API auto
-launch_gather_batch(const Gpu& gpu,
+launch_gather_table(const Gpu& gpu,
                     gpu_stream_t stream,
                     std::size_t elem_bytes,
                     const void* field_base,
                     void* stage_base,
-                    const PackBatch& batch) -> gpu_error_t;
+                    const PackTable& table) -> gpu_error_t;
 
-/** Inverse of @ref launch_gather_batch. */
+/** Inverse of @ref launch_gather_table. */
 [[nodiscard]] CARBON_API auto
-launch_scatter_batch(const Gpu& gpu,
+launch_scatter_table(const Gpu& gpu,
                      gpu_stream_t stream,
                      std::size_t elem_bytes,
                      const void* stage_base,
                      void* field_base,
-                     const PackBatch& batch) -> gpu_error_t;
+                     const PackTable& table) -> gpu_error_t;
 
 }  // namespace carbon::detail::halo_pack
 
