@@ -18,8 +18,8 @@ n<N>-g<G>.json``.
 - ``load_sweep_config(text, env, only)`` / ``read_sweep_config(path, only)`` return the
   global keys plus ``experiments``: ``name -> dict`` with every global and matrix key
   filled in, ``type`` and ``name``.
-- ``runs(exp)`` enumerates the (grid, decomposition, transport, hp_halo, gpus) cells of one
-  experiment, ``label(...)`` names their reports and ``all_runs(cfg)`` merges every
+- ``runs(exp)`` enumerates the (grid, decomposition, transport, hp_halo, overlap, gpus) cells
+  of one experiment, ``label(...)`` names their reports and ``all_runs(cfg)`` merges every
   experiment into the deduplicated list the run script executes.
 - Run as a script it reads the YAML text from ``$LBM_SWEEP_CONFIG`` (experiments from
   ``$LBM_SWEEP_ONLY``, comma or space separated, empty = all), lets the env var of a global
@@ -69,16 +69,24 @@ MATRIX_KEYS: dict[str, tuple[str, object]] = {
     "transports": ("words", ["intra", "mpi", "mpip2p"]),
     "mpi_single_gpu": ("bool", False),
     "hp_halo": ("words", ["off"]),
+    "halo_exchange": ("words", ["staged"]),
+    "overlaps": ("words", None),
     "plots": ("words", None),
 }
 # Experiment type -> the figures it can draw (all by default) and the plotter drawing them.
 TYPES: dict[str, list[str]] = {
-    "strong_scaling": ["vs_gpus", "hp_speedup", "grids", "disg_vs_dense"],
+    "strong_scaling": ["vs_gpus", "hp_speedup", "grids", "disg_vs_dense", "direct_speedup"],
     "domain_size": ["vs_n"],
     "best_family": ["best_family"],
 }
 SINGLE_GRIDS = ("dense", "disg")
 DISTRIBUTED_GRIDS = ("dense_distributed", "disg_distributed")
+# A Direct halo exchange run is its own decomposition variant: it gets its own report label
+# and plot panel. --halo-exchange direct only changes dense_distributed pencil and brick runs
+# (slab and the other grids keep the staged passes), so only those get the variant.
+DIRECT_SUFFIX = "-direct"
+DIRECT_GRIDS = ("dense_distributed",)
+DIRECT_DECOMPOSITIONS = ("pencil", "brick")
 CHOICES = {
     "runner": {"docker", "local"},
     "configs": {"q19:bgk", "q27:bgk", "q27:kbc"},
@@ -87,7 +95,9 @@ CHOICES = {
     "decompositions": {"slab", "pencil", "brick"},
     "transports": {"intra", "mpi", "mpip2p"},
     "hp_halo": {"off", "on"},
+    "halo_exchange": {"staged", "direct"},
     "overlap": {"none", "standard", "extended", "twoway-extended"},
+    "overlaps": {"none", "standard", "extended", "twoway-extended"},
     "plots": {f for figs in TYPES.values() for f in figs},
 }
 TOKEN = re.compile(r"^[A-Za-z0-9._:/-]+$")
@@ -219,6 +229,8 @@ def load_sweep_config(text: str, env: dict[str, str] | None = None,
         exp["type"] = etype
         if exp["plots"] is None:
             exp["plots"] = list(TYPES[etype])
+        if exp["overlaps"] is None:
+            exp["overlaps"] = [cfg["overlap"]]
         validate(exp)
         experiments[name] = exp
     if only:
@@ -245,9 +257,15 @@ def validate(exp: dict[str, object]) -> None:
     if distributed and not set(exp["transports"]) & {"mpi", "mpip2p"}:
         raise SweepConfigError(f"experiment {name}: grids {distributed} run under mpiexec "
                                "only; add mpi or mpip2p to transports")
-    if "on" in exp["hp_halo"] and exp["overlap"] == "none":
-        raise SweepConfigError(f"experiment {name}: hp_halo on needs overlap != none (no halo "
-                               "stream to prioritise otherwise)")
+    if exp["hp_halo"] == ["on"] and exp["overlaps"] == ["none"]:
+        raise SweepConfigError(f"experiment {name}: hp_halo on needs an overlap other than none "
+                               "(no halo stream to prioritise otherwise)")
+    if "direct" in exp["halo_exchange"] and not (
+            set(exp["grids"]) & set(DIRECT_GRIDS)
+            and set(exp["decompositions"]) & set(DIRECT_DECOMPOSITIONS)):
+        raise SweepConfigError(f"experiment {name}: halo_exchange direct only applies to grids "
+                               f"{list(DIRECT_GRIDS)} with decompositions "
+                               f"{list(DIRECT_DECOMPOSITIONS)}")
     if exp["type"] == "best_family" and not ({"dense", "disg"} <= set(exp["grids"])
                                              and {"intra", "mpi"} <= set(exp["transports"])):
         raise SweepConfigError(f"experiment {name}: best_family needs grids dense and disg "
@@ -257,50 +275,91 @@ def validate(exp: dict[str, object]) -> None:
                                "empty")
 
 
+def split_decomposition(decomposition: str) -> tuple[str, str]:
+    """``(decomposition, halo exchange)`` of a decomposition variant: ``pencil-direct`` is
+    ``(pencil, direct)``, ``brick-direct`` is ``(brick, direct)``, a plain decomposition is
+    ``staged``."""
+    if decomposition.endswith(DIRECT_SUFFIX):
+        return decomposition[:-len(DIRECT_SUFFIX)], "direct"
+    return decomposition, "staged"
+
+
+def decomposition_variants(exp: dict[str, object], grid: str) -> list[str]:
+    """The decompositions of a distributed grid, each Direct-capable one once per
+    ``halo_exchange`` entry (``pencil`` for staged, ``pencil-direct`` for direct; same for
+    ``brick``)."""
+    out = []
+    for decomp in exp["decompositions"]:
+        for mode in exp["halo_exchange"]:
+            if mode == "staged":
+                out.append(decomp)
+            elif grid in DIRECT_GRIDS and decomp in DIRECT_DECOMPOSITIONS:
+                out.append(decomp + DIRECT_SUFFIX)
+    return list(dict.fromkeys(out))
+
+
 def gpus_of(exp: dict[str, object], decomposition: str) -> list[int]:
     """GPU counts swept for a decomposition: slab uses ``gpus``, the others their own key."""
+    decomposition = split_decomposition(decomposition)[0]
     return exp["gpus"] if decomposition == "slab" else exp[f"gpus_{decomposition}"]
 
 
-def runs(exp: dict[str, object]) -> list[tuple[str, str, str, str, int]]:
-    """``(grid, decomposition, transport, hp_halo, gpus)`` of every run, sizes aside.
+def runs(exp: dict[str, object]) -> list[tuple[str, str, str, str, str, int]]:
+    """``(grid, decomposition, transport, hp_halo, overlap, gpus)`` of every run, sizes aside.
 
     - ``dense`` / ``disg`` run on every ``gpus`` entry with every transport; decomposition
       is always ``slab`` (single-process grids split z across GPUs).
     - ``dense_distributed`` / ``disg_distributed`` need one MPI rank per GPU, so they skip
       ``intra``; each decomposition runs on its own GPU counts (``gpus_of``).
+      ``halo_exchange: [.., direct]`` adds ``pencil-direct`` and ``brick-direct`` for
+      ``dense_distributed``
+      (``decomposition_variants``); every other run is staged.
     - ``mpi`` / ``mpip2p`` skip G=1: a single rank has no halo exchange. With
       ``mpi_single_gpu`` the single-process grids run them at G=1 anyway (one rank,
       pinned to GPU 0 by the run script), so per-transport plots start at 1 GPU.
+    - every run is done once per ``overlaps`` entry, except hp-halo on with overlap ``none``
+      (no halo stream to prioritise).
     """
     out = []
     for grid in exp["grids"]:
         distributed = grid in DISTRIBUTED_GRIDS
-        decomps = exp["decompositions"] if distributed else ["slab"]
+        decomps = decomposition_variants(exp, grid) if distributed else ["slab"]
         for decomp in decomps:
             gpus = gpus_of(exp, decomp) if distributed else exp["gpus"]
             for transport in exp["transports"]:
                 if distributed and transport == "intra":
                     continue
                 for hp in exp["hp_halo"]:
-                    for g in gpus:
-                        if (transport != "intra" and g == 1
-                                and (distributed or not exp["mpi_single_gpu"])):
+                    for ov in exp["overlaps"]:
+                        if hp == "on" and ov == "none":
                             continue
-                        out.append((grid, decomp, transport, hp, g))
+                        for g in gpus:
+                            if (transport != "intra" and g == 1
+                                    and (distributed or not exp["mpi_single_gpu"])):
+                                continue
+                            out.append((grid, decomp, transport, hp, ov, g))
     return out
 
 
-def label(grid: str, decomposition: str, transport: str, hp_halo: str) -> str:
+def overlap_tag(exp: dict[str, object], overlap: str) -> str:
+    """The overlap a report label spells out: none when it is the global ``overlap`` (so the
+    reports of single-overlap sweeps keep their names), else the mode."""
+    return "" if overlap == exp["overlap"] else overlap
+
+
+def label(grid: str, decomposition: str, transport: str, hp_halo: str, ov_tag: str = "") -> str:
     """Report label of one run, the ``<label>`` in ``<series>-<label>-n<N>-g<G>.json``.
 
     Single-process grids keep the historic ``<grid>-<transport>`` (``-hpon`` appended
     when the halo stream is prioritised); distributed grids spell out everything:
-    ``<grid>-<decomposition>-<transport>-hp<off|on>``.
+    ``<grid>-<decomposition>-<transport>-hp<off|on>``, with ``pencil-direct`` as the
+    decomposition of a Direct halo exchange run. ``-ov<mode>`` is appended for a run whose
+    overlap is not the global one (``ov_tag``, see ``overlap_tag``).
     """
+    ov = f"-ov{ov_tag}" if ov_tag else ""
     if grid in DISTRIBUTED_GRIDS:
-        return f"{grid}-{decomposition}-{transport}-hp{hp_halo}"
-    return f"{grid}-{transport}" + ("-hpon" if hp_halo == "on" else "")
+        return f"{grid}-{decomposition}-{transport}-hp{hp_halo}{ov}"
+    return f"{grid}-{transport}" + ("-hpon" if hp_halo == "on" else "") + ov
 
 
 def series_prefixes(exp: dict[str, object]) -> list[tuple[str, str, str, str]]:
@@ -319,14 +378,15 @@ def series_prefixes(exp: dict[str, object]) -> list[tuple[str, str, str, str]]:
 
 def all_runs(cfg: dict[str, object]) -> list[tuple[str, ...]]:
     """Every run of every selected experiment, once: ``(lattice, collision, precision,
-    grid, decomposition, transport, hp_halo, gpus, n, label)``, in experiment order."""
+    grid, decomposition, transport, hp_halo, overlap, gpus, n, label)``, in experiment order."""
     seen: dict[tuple[str, ...], None] = {}
     for exp in cfg["experiments"].values():
         for _, lattice, collision, precision in series_prefixes(exp):
-            for grid, decomp, t, hp, g in runs(exp):
+            for grid, decomp, t, hp, ov, g in runs(exp):
                 for n in exp["sizes"]:
-                    seen.setdefault((lattice, collision, precision, grid, decomp, t, hp,
-                                     str(g), str(n), label(grid, decomp, t, hp)), None)
+                    run_label = label(grid, decomp, t, hp, overlap_tag(exp, ov))
+                    seen.setdefault((lattice, collision, precision, grid, decomp, t, hp, ov,
+                                     str(g), str(n), run_label), None)
     return list(seen)
 
 

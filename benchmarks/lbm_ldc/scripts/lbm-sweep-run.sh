@@ -31,13 +31,16 @@
 # would grab every visible GPU). The distributed grids skip intra.
 #
 # Timing (global, shared by every experiment): warmup solver steps, then reps
-# timed repetitions of iters_per_rep solver steps (binary --reps).
+# timed repetitions of iters_per_rep solver steps (binary --reps). The overlap
+# mode is the global overlap key unless an experiment lists overlaps; a run
+# whose overlap is not the global one gets -ov<mode> appended to its label.
 #
 # Reports: <data_dir>/json/<lattice>-<collision>-<precision>-<label>-n<N>-g<G>.json
 # with <label> = <grid>-<transport> for dense / disg (plus -hpon with hp_halo
 # on) and <grid>-<decomposition>-<transport>-hp<off|on> for the distributed
-# grids. With force: false an existing report is reused only if its iters,
-# warmup, reps and overlap match this sweep; otherwise the run is redone.
+# grids (decomposition pencil-direct / brick-direct: --decomposition pencil|brick
+# --halo-exchange direct, from halo_exchange: direct). With force: false an existing report is reused only if its iters,
+# warmup, reps and overlap match the run; otherwise the run is redone.
 # force: true redoes every run.
 #
 # Progress: <data_dir>/trace.log gets a header, one line per run with a
@@ -114,7 +117,7 @@ n_intra=0
 n_mpi=0
 n_existing=0
 for r in "${runs[@]}"; do
-  IFS=: read -r lattice collision prec grid decomp t hp g n label <<< "${r}"
+  IFS=: read -r lattice collision prec grid decomp t hp ov g n label <<< "${r}"
   if [[ "${t}" == "intra" ]]; then
     n_intra=$((n_intra + 1))
   else
@@ -135,13 +138,13 @@ names=()
 for e in "${experiments[@]}"; do
   IFS=: read -r name etype count <<< "${e}"
   names+=("${name}")
-  printf '    %-20s %-15s %6d runs\n' "${name}" "${etype}" "${count}"
+  printf '    %-24s %-15s %6d runs\n' "${name}" "${etype}" "${count}"
 done
 echo "==> ${#runs[@]} distinct runs (${n_intra} Peeraccess, ${n_mpi} NCCL / MPI (P2P));" \
      "${n_existing} reports already in ${DATA_DIR}/json"
 if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
   for r in "${runs[@]}"; do
-    IFS=: read -r lattice collision prec grid decomp t hp g n label <<< "${r}"
+    IFS=: read -r lattice collision prec grid decomp t hp ov g n label <<< "${r}"
     printf '    %-7s %s\n' "${t}" "${lattice}-${collision}-${prec}-${label}-n${n}-g${g}"
   done
   exit 0
@@ -262,7 +265,7 @@ trace_line() {
 
 mode_runs=()
 for r in ${RUNS}; do
-  IFS=: read -r _ _ _ _ _ t _ _ _ _ <<< "${r}"
+  IFS=: read -r _ _ _ _ _ t _ _ _ _ _ <<< "${r}"
   if [[ "${mode}" == "intra" && "${t}" == "intra" ]] ||
      [[ "${mode}" != "intra" && "${t}" != "intra" ]]; then
     mode_runs+=("${r}")
@@ -283,17 +286,17 @@ mkdir -p "${OUT_DIR}"
 iters=$((WARMUP + REPS * ITERS_PER_REP))
 settings_match() {
   grep -Eq "\"iters\": *${iters}," "$1" && grep -Eq "\"warmup\": *${WARMUP}," "$1" &&
-    grep -Eq "\"reps\": *${REPS}," "$1" && grep -Eq "\"overlap\": *\"${OVERLAP}\"" "$1"
+    grep -Eq "\"reps\": *${REPS}," "$1" && grep -Eq "\"overlap\": *\"$2\"" "$1"
 }
 run_log="$(mktemp)"
 
 for r in "${mode_runs[@]}"; do
-  IFS=: read -r lattice collision prec grid decomp t hp g n label <<< "${r}"
+  IFS=: read -r lattice collision prec grid decomp t hp ov g n label <<< "${r}"
   name="${lattice}-${collision}-${prec}-${label}-n${n}-g${g}"
   report="${OUT_DIR}/${name}.json"
   redo=0
   if [[ -f "${report}" && "${FORCE}" -eq 0 ]]; then
-    if settings_match "${report}"; then
+    if settings_match "${report}" "${ov}"; then
       done_n=$((done_n + 1))
       n_skip=$((n_skip + 1))
       echo "==> [skip exists] ${name}.json"
@@ -311,7 +314,11 @@ for r in "${mode_runs[@]}"; do
       cmd=(mpiexec --bind-to none -n "${g}")
       [[ "${t}" == "mpip2p" ]] && cmd+=(-x CARBON_DIST_TRANSPORT=mpi)
       cmd+=("${bin}")
-      extra+=(--decomposition "${decomp}" --gpus 1) ;;
+      if [[ "${decomp}" == *-direct ]]; then
+        extra+=(--decomposition "${decomp%-direct}" --halo-exchange direct --gpus 1)
+      else
+        extra+=(--decomposition "${decomp}" --gpus 1)
+      fi ;;
     *:mpi)    cmd=(mpiexec -n "${g}" "${bin}") ;;
     *:mpip2p) cmd=(mpiexec -n "${g}" -x CARBON_DIST_TRANSPORT=mpi "${bin}") ;;
   esac
@@ -323,7 +330,7 @@ for r in "${mode_runs[@]}"; do
   timeout "${RUN_TIMEOUT}" "${cmd[@]}" \
     --grid "${grid}" --n "${n}" --iters "${iters}" --warmup "${WARMUP}" --reps "${REPS}" \
     --lattice "${lattice}" --collision "${collision}" --precision "${prec}" \
-    --overlap "${OVERLAP}" "${extra[@]}" \
+    --overlap "${ov}" "${extra[@]}" \
     --report-every 0 --label "${label}" --report "${report}" 2>&1 | tee "${run_log}"
   rc=${PIPESTATUS[0]}
   ms=$(( ($(date +%s%N) - t0) / 1000000 ))
@@ -368,7 +375,8 @@ export SWEEP_START="$(date +%s)"
   echo "    experiments: ${names[*]}"
   echo "    ${RUN_TOTAL} runs (${n_intra} Peeraccess, ${n_mpi} NCCL / MPI (P2P)),"
   echo "    ${n_existing} reports already in ${DATA_DIR}/json, force=${FORCE}"
-  echo "    timing: warmup ${WARMUP}, ${REPS} x ${ITERS_PER_REP} steps, overlap ${OVERLAP}"
+  echo "    timing: warmup ${WARMUP}, ${REPS} x ${ITERS_PER_REP} steps, overlap ${OVERLAP}" \
+       "(unless the experiment lists overlaps)"
 } >> "${trace}"
 echo "==> progress: tail -f ${DATA_DIR}/trace.log"
 

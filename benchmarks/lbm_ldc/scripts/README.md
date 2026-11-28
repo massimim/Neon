@@ -38,13 +38,14 @@ A sweep YAML has two parts:
 - **`experiments`**, a mapping from a name to a `type` plus its run matrix
   (`configs`, `precisions`, `sizes`, `gpus`, `grids`, `decompositions`,
   `gpus_pencil`, `gpus_brick`, `transports`, `mpi_single_gpu`, `hp_halo`,
-  `plots`). Matrix keys at the top level are defaults for every experiment.
+  `overlaps`, `halo_exchange`, `plots`). Matrix keys at the top level are defaults for every
+  experiment.
 
 The type decides which figures the plotters draw; `plots` picks a subset:
 
 | Type | Figures (`plots`) | Plotter |
 | --- | --- | --- |
-| `strong_scaling` | `vs_gpus`, `hp_speedup`, `grids`, `disg_vs_dense` | `plot_scaling.py`, `plot_disg_vs_dense.py` |
+| `strong_scaling` | `vs_gpus`, `hp_speedup`, `grids`, `direct_speedup`, `disg_vs_dense` | `plot_scaling.py`, `plot_disg_vs_dense.py` |
 | `domain_size` | `vs_n` | `plot_scaling.py` |
 | `best_family` | `best_family` | `plot_best_family.py` |
 
@@ -52,7 +53,8 @@ Because the timing is global, a run is identified by its matrix cell alone:
 two experiments that both need, say, the 1-GPU `dense-intra` run at N=512 get
 it from the same report, and the sweep script runs it once. Unknown keys,
 invalid values and contradictory combinations (a distributed grid without an
-MPI transport, `hp_halo: on` with `overlap: none`, a figure that does not
+MPI transport, `hp_halo: on` with `overlap: none`, `halo_exchange: direct`
+without `dense_distributed` pencil or brick, a figure that does not
 belong to the type, a `best_family` experiment without Dense, DenseDisg,
 Peeraccess and NCCL) are rejected before anything runs.
 
@@ -69,7 +71,12 @@ and the first three parts are the *series*; the label encodes the family:
 | `<grid>-<decomposition>-<transport>-hp<off\|on>` | `dense_distributed` / `disg_distributed` | NCCL or MPI (P2P), one rank per GPU, the domain split by `--decomposition slab\|pencil\|brick` |
 
 A `-hpon` suffix on a `dense` / `disg` label marks a run with `--hp-halo`
-(high-priority halo stream).
+(high-priority halo stream). The decompositions `pencil-direct` and
+`brick-direct` (e.g. `dense_distributed-brick-direct-mpi-hpoff`) mark a
+`dense_distributed` pencil or brick run with `--halo-exchange direct`. A run
+whose overlap mode is not the global `overlap` ends in `-ov<mode>` (e.g.
+`dense_distributed-slab-mpi-hpoff-ovnone`); runs at the global mode keep the
+plain label, so existing reports stay valid.
 
 Every scaling plot shows **MLUPS per GPU**:
 
@@ -92,6 +99,19 @@ DRY_RUN=1 ./benchmarks/lbm_ldc/scripts/lbm-sweep-run.sh $cfg   # list the runs
 ./benchmarks/lbm_ldc/scripts/lbm-sweep-run.sh $cfg --only grids,n512
 tail -f benchmarks/lbm_ldc/data/trace.log
 ```
+
+`halo_exchange` compares the halo exchange setups of `dense_distributed`: slab,
+pencil and brick, the last two staged and direct, at 4 and 8 GPUs (brick at 8),
+N = 256 ... 512, hp-halo off / on and overlap none / standard (120 runs);
+`halo_exchange_reference` adds the five 1-GPU Dense runs of its ideal line:
+
+```bash
+./benchmarks/lbm_ldc/scripts/lbm-sweep-run.sh $cfg --only halo_exchange,halo_exchange_reference
+python3 benchmarks/lbm_ldc/scripts/plotting/plot_scaling.py --config $cfg --only halo_exchange
+```
+
+The CG benchmark has the same experiment in
+[`../../cg/scripts/cg-sweep.yml`](../../cg/scripts/cg-sweep.yml).
 
 - **Build.** With `runner: docker` (default) the script configures and builds
   Release trees inside `image_intra`: `build_dir` (default `build/`) and, when
@@ -119,7 +139,13 @@ tail -f benchmarks/lbm_ldc/data/trace.log
     `CUDA_VISIBLE_DEVICES=0` (a plain `mpiexec -n 1` would pick up every
     visible GPU);
   - every cell runs once per `hp_halo` entry (`off` default, `on` adds
-    `--hp-halo`), with `--overlap OVERLAP` (default `standard`).
+    `--hp-halo`) and once per `overlaps` entry (default: the global
+    `overlap`, `standard`), except `hp_halo: on` with overlap `none`, which
+    has no halo stream to prioritise;
+  - with `halo_exchange: [staged, direct]`, `dense_distributed` pencil and
+    brick also run as `pencil-direct` / `brick-direct` (`--decomposition
+    pencil|brick --halo-exchange direct`), each plotted as its own panel next
+    to the staged one.
 
   The union over the selected experiments is run once per distinct cell.
 - **Configs and precisions.** `configs` holds lattice:collision pairs, any of
@@ -164,6 +190,7 @@ python3 benchmarks/lbm_ldc/scripts/plotting/plot_scaling.py --config $cfg
 #   strong_scaling: <series>-mlups-per-gpu-vs-gpus-n<N>.png   every size N        (vs_gpus)
 #                   <series>-hp-speedup-<transport>.png       hp_halo off and on  (hp_speedup)
 #                   <series>-grids-n<N>.png                   2+ grids, every N   (grids)
+#                   <series>-direct-speedup.png               staged and direct   (direct_speedup)
 #   domain_size:    <series>-mlups-per-gpu-vs-n-g<G>.png      largest GPU count G (vs_n)
 python3 benchmarks/lbm_ldc/scripts/plotting/plot_disg_vs_dense.py --config $cfg
 #   strong_scaling: <series>-disg-vs-dense-<transport>-hp<off|on>.png, <series>-disg-vs-dense.csv
@@ -177,8 +204,11 @@ the experiments and `--show` pops each figure up. Series without reports are
 skipped with a warning. The plotters need `matplotlib`.
 
 Scaling panels are one per grid (per grid × decomposition for the distributed
-grids), with one curve per transport × hp-halo; distributed panels label each
-GPU count with the process grid ProcessGrid chose. The `grids` figure puts
+grids), with one curve per transport × hp-halo × overlap (an overlap other
+than the global one is drawn dotted with square markers); distributed panels
+label each GPU count with the process grid ProcessGrid chose. `direct_speedup`
+plots MLUPS(direct) / MLUPS(staged) against N, one panel per decomposition run
+both ways, one curve per GPU count × transport × hp-halo × overlap. The `grids` figure puts
 every grid on shared axes: the left panel is the same transport for all
 (NCCL, slab, hp-halo off), the right one each grid's fastest run per GPU
 count, with a table of the winning configuration under it.

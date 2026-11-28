@@ -69,10 +69,11 @@ docker-logs/
 # Generated libcarbonpy copy for in-tree Python tests (see libcarbonpy/CMakeLists.txt).
 /py/carbon/lib/
 
-# Generated benchmark reports / plots. LBM sweeps write data/; the committed
-# copy for future reference is reference/.
+# Generated benchmark reports / plots. LBM and CG sweeps write data/; the
+# committed copy for future reference is reference/.
 /reports/
 /benchmarks/lbm_ldc/data/
+/benchmarks/cg/data/
 !/benchmarks/lbm_ldc/reference/json/*.json
 
 # Python bytecode caches.

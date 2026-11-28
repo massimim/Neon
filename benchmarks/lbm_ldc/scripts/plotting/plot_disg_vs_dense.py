@@ -92,7 +92,8 @@ def plot_experiment(exp: dict, json_dir: Path, out_dir: Path, show: bool) -> boo
         for t in exp["transports"]:
             for hp in exp["hp_halo"]:
                 ran = [(disg, dense) for disg, dense in twins
-                       if (t, hp) in s.curves(disg) and (t, hp) in s.curves(dense)]
+                       if (t, hp, s.overlap) in s.curves(disg)
+                       and (t, hp, s.overlap) in s.curves(dense)]
                 if not ran:
                     continue
                 fig, axes = plt.subplots(1, len(ran), figsize=(5 * len(ran), 4.3),

@@ -37,10 +37,13 @@ GRID_STYLES = {
     "dense_distributed": ("#2ca02c", "s"),
     "disg_distributed": ("#9467bd", "s"),
 }
-DECOMP_TITLES = {"slab": "slab (z)", "pencil": "pencil (y, z)", "brick": "brick (x, y, z)"}
+DECOMP_TITLES = {"slab": "slab (z)", "pencil": "pencil (y, z)", "brick": "brick (x, y, z)",
+                 "pencil-direct": "pencil (y, z), direct halo",
+                 "brick-direct": "brick (x, y, z), direct halo"}
 TRANSPORT_NAMES = {"intra": "Peeraccess", "mpi": "NCCL", "mpip2p": "MPI (P2P)"}
 TRANSPORT_COLORS = {"intra": "#d62728", "mpi": "#1f77b4", "mpip2p": "#2ca02c"}
 HP_STYLES = {"off": ("D", "-"), "on": ("o", "--")}
+OVERLAP_STYLE = ("s", ":")
 MLUPS_PER_GPU_LABEL = "MLUPS per GPU (10\u2076 lattice updates / s / GPU)"
 
 
@@ -114,16 +117,18 @@ def load(report_dir: Path, series: str, label: str, n: int, g: int) -> Report | 
     return Report(path, g, raw)
 
 
-def describe(report: Report) -> str:
+def describe(report: Report, overlap: str | None = None) -> str:
     """Run setup for figure titles, e.g. ``D3Q19+BGK fp32, overlap=standard, A100``.
 
-    Reports written before ``--precision`` existed have no ``precision`` key; they are fp32.
+    ``overlap`` replaces the report's own overlap (e.g. ``per curve`` for a figure mixing
+    several). Reports written before ``--precision`` existed have no ``precision`` key; they
+    are fp32.
     """
     cfg = report.raw.get("config", {})
     gpus = report.raw.get("system", {}).get("gpus", [])
     text = (f"D3{str(cfg.get('lattice', 'q19')).upper()}+"
             f"{str(cfg.get('collision', 'bgk')).upper()} {cfg.get('precision', 'fp32')}, "
-            f"overlap={cfg.get('overlap', 'standard')}")
+            f"overlap={overlap or cfg.get('overlap', 'standard')}")
     return text + (f", {gpus[0]['name']}" if gpus else "")
 
 

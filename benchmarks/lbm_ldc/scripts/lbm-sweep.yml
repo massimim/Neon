@@ -90,6 +90,16 @@ run_timeout: 1800
 #   mpi_single_gpu  true also runs NCCL / MPI (P2P) of dense / disg at 1 GPU
 #                   (one rank pinned to GPU 0)
 #   hp_halo         off and/or on (--hp-halo: high-priority halo stream)
+#   overlaps        overlap modes to run (default: [overlap], the global key);
+#                   a run whose mode is not the global overlap gets -ov<mode>
+#                   in its report label. hp_halo on is skipped with none
+#   halo_exchange   staged and/or direct (--halo-exchange; default [staged]).
+#                   direct exchanges every halo cell with the rank that owns
+#                   it in one packed pass (8 neighbours for pencil, 26 for
+#                   brick); it only exists for dense_distributed pencil and
+#                   brick, which then also run as the decompositions
+#                   pencil-direct / brick-direct (own reports and plot
+#                   panels); every other run stays staged
 #   plots           subset of the figures of the experiment's type (default all;
 #                   [] for an experiment that only provides runs, e.g. the
 #                   1-GPU reference of the distributed grids)
@@ -105,6 +115,9 @@ precisions: [fp32]
 #                                              (needs hp_halo off and on)
 #                   grids                      plot_scaling.py: every grid on shared
 #                                              axes, NCCL slab and fastest config
+#                   direct_speedup             plot_scaling.py: MLUPS(direct) /
+#                                              MLUPS(staged) vs N (needs
+#                                              halo_exchange staged and direct)
 #                   disg_vs_dense              plot_disg_vs_dense.py: DenseDisg /
 #                                              Dense ratio (+ CSV)
 #   domain_size     vs_n                       plot_scaling.py: MLUPS/GPU vs N at
@@ -140,6 +153,35 @@ experiments:
     grids: [dense, disg]
     transports: [intra, mpi]
     mpi_single_gpu: true
+
+  # DenseDistributed slab, then pencil and brick each with the staged (one pass
+  # per axis) and the direct halo exchange, side by side, at 4 and 8 GPUs
+  # (brick only at 8), with hp-halo off / on and overlap none / standard
+  # (hp-halo on is skipped with none). The staged standard runs are shared with
+  # grids. The ideal line needs halo_exchange_reference:
+  #   lbm-sweep-run.sh lbm-sweep.yml --only halo_exchange,halo_exchange_reference
+  halo_exchange:
+    type: strong_scaling
+    sizes: {start: 256, stop: 512, step: 64}
+    gpus: [4, 8]
+    gpus_pencil: [4, 8]
+    gpus_brick: [8]
+    grids: [dense_distributed]
+    decompositions: [slab, pencil, brick]
+    transports: [mpi]
+    hp_halo: ["off", "on"]
+    overlaps: [none, standard]
+    halo_exchange: [staged, direct]
+    plots: [vs_gpus, direct_speedup]
+
+  # 1-GPU Dense runs for the ideal line of halo_exchange (also part of grids).
+  halo_exchange_reference:
+    type: strong_scaling
+    sizes: {start: 256, stop: 512, step: 64}
+    gpus: [1]
+    grids: [dense]
+    transports: [intra]
+    plots: []
 
   # Every transport of Dense / DenseDisg at N=512 on 1, 2, 4 and 8 GPUs.
   n512:

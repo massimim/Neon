@@ -1,0 +1,100 @@
+# Sweep configuration for cg-sweep-run.sh and plot_cg_scaling.py.
+#
+#   ./benchmarks/cg/scripts/cg-sweep-run.sh benchmarks/cg/scripts/cg-sweep.yml
+#   python3 benchmarks/cg/scripts/plot_cg_scaling.py \
+#       --config benchmarks/cg/scripts/cg-sweep.yml
+#
+# Same layout as benchmarks/lbm_ldc/scripts/lbm-sweep.yml: global keys, matrix
+# defaults, then experiments, each a type plus its own run matrix. A run two
+# experiments need is executed once. DRY_RUN=1 lists every run; --only runs a
+# subset of the experiments. An env var named after a global key in upper case
+# (RUNNER, FORCE, SKIP_BUILD, WARMUP, ...) overrides the file.
+
+# docker builds and runs inside image; local uses the host's cmake / nvcc /
+# mpiexec.
+runner: docker
+
+# Timing of every run: warmup untimed CG iterations, then reps repetitions of
+# iters_per_rep iterations (--max_iter = warmup + reps * iters_per_rep). The
+# tolerances are 1e-30, so every run does all its iterations; the residual
+# reaches round-off well before that on these sizes, which leaves the work per
+# iteration unchanged.
+warmup: 100
+iters_per_rep: 200
+reps: 5
+
+# Skeleton OCC mode of every run unless an experiment lists overlaps: none,
+# standard, extended, twoway-extended.
+overlap: standard
+
+# 1-GPU run whose MDOF/s draws the dashed "ideal" line of the MDOF/s-per-GPU
+# plots: cg-<reference_label>-n<N>-g1.json.
+reference_label: dense
+
+# Output folder, relative to the carbon repo root: reports in json/, plots in
+# plots/<experiment>/, progress in trace.log, failed runs in failed.txt.
+data_dir: benchmarks/cg/data
+
+# CUDA compute capability (CMAKE_CUDA_ARCHITECTURES); auto asks nvidia-smi.
+sm_arch: auto
+
+# One CUDA+MPI build serves every run (single-process runs start without
+# mpiexec). The image's NCCL is pinned to match this host's driver.
+image: carbon-cuda-nccl-pinned:local
+build_dir: build-mpi
+skip_build: false
+
+# false reuses a report whose max_iter, warmup, reps and overlap match this
+# file; true redoes every run.
+force: false
+
+# Seconds before a single run is killed (guards against NCCL / MPI hangs).
+run_timeout: 900
+
+# Matrix keys: defaults for every experiment; each experiment can override them.
+#
+#   sizes           domain edge lengths N (N^3 cells): a list or {start, stop, step}
+#   gpus            GPU counts of dense / disg (one process) and of slab runs
+#   grids           dense, disg (one process, z split across its GPUs);
+#                   dense_distributed, disg_distributed (one MPI rank per GPU,
+#                   split by the decompositions, skip 1 GPU)
+#   decompositions  slab (z), pencil (y, z), brick (x, y, z)
+#   gpus_pencil     GPU counts of pencil runs (default [4, 8])
+#   gpus_brick      GPU counts of brick runs (default [8])
+#   hp_halo         off and/or on (--hp-halo: high-priority halo streams)
+#   overlaps        overlap modes to run (default: [overlap]); a run whose mode
+#                   is not the global overlap gets -ov<mode> in its label.
+#                   hp_halo on is skipped with none
+#   halo_exchange   staged and/or direct (--halo-exchange); direct exists for
+#                   dense_distributed pencil and brick, which then also run as
+#                   pencil-direct / brick-direct (own reports and panels)
+#   plots           subset of the experiment type's figures ([] = runs only)
+#
+# Experiment types and figures (plot_cg_scaling.py):
+#   strong_scaling  vs_gpus         MDOF/s per GPU vs GPU count, per size N
+#                   direct_speedup  MDOF/s(direct) / MDOF/s(staged) vs N
+experiments:
+  # DenseDistributed slab, then pencil and brick each with the staged (one pass
+  # per axis) and the direct halo exchange, at 4 and 8 GPUs (brick only at 8),
+  # with hp-halo off / on and overlap none / standard (hp-halo on is skipped
+  # with none). The ideal line needs reference:
+  #   cg-sweep-run.sh cg-sweep.yml --only halo_exchange,reference
+  halo_exchange:
+    type: strong_scaling
+    sizes: {start: 256, stop: 512, step: 64}
+    gpus: [4, 8]
+    gpus_pencil: [4, 8]
+    gpus_brick: [8]
+    grids: [dense_distributed]
+    decompositions: [slab, pencil, brick]
+    hp_halo: ["off", "on"]
+    overlaps: [none, standard]
+    halo_exchange: [staged, direct]
+
+  # 1-GPU Dense runs for the ideal line.
+  reference:
+    type: strong_scaling
+    sizes: {start: 256, stop: 512, step: 64}
+    gpus: [1]
+    grids: [dense]
+    plots: []

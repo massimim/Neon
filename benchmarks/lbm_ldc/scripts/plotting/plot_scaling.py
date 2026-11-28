@@ -2,7 +2,8 @@
 """Plot LBM strong scaling as MLUPS per GPU.
 
 One panel per grid (``dense``, ``disg``) or distributed grid x decomposition
-(``dense_distributed`` slab | pencil | brick, ...), one curve per transport x hp-halo.
+(``dense_distributed`` slab | pencil | brick, ...), one curve per transport x hp-halo x
+overlap (an overlap other than the global one is drawn dotted with square markers).
 The y axis is always ``results.mlups / G``, so perfect strong scaling is a horizontal
 line: the dashed "ideal" line is the 1-GPU reference run of the same size N.
 
@@ -22,6 +23,10 @@ experiment's ``plots`` key into ``<data_dir>/plots/<experiment>/``:
                                                          each grid's fastest run per GPU
                                                          count, tagged with its
                                                          configuration (two or more grids)
+    direct_speedup <series>-direct-speedup.png           MLUPS(direct) / MLUPS(staged) vs N,
+                                                         one panel per decomposition with
+                                                         both, one curve per GPU count x
+                                                         hp-halo x overlap
   domain_size
     vs_n        <series>-mlups-per-gpu-vs-n-g<G>.png     MLUPS/GPU vs N at the largest GPU
                                                          count G, against the per-N
@@ -66,6 +71,7 @@ class Series:
                  reference: tuple[Path, str, str]) -> None:
         self.name = name
         self.cfg = cfg
+        self.overlap = cfg["overlap"]
         self.cells = sc.runs(cfg)
         ref_dir, ref_series, ref_label = reference
         self.ref_name = ref_label
@@ -75,8 +81,8 @@ class Series:
             ref = lr.load(ref_dir, ref_series, ref_label, n, 1)
             if ref is not None:
                 self.refs[n] = ref
-            for grid, decomp, t, hp, g in self.cells:
-                label = sc.label(grid, decomp, t, hp)
+            for grid, decomp, t, hp, ov, g in self.cells:
+                label = sc.label(grid, decomp, t, hp, sc.overlap_tag(cfg, ov))
                 rep = lr.load(report_dir, name, label, n, g)
                 if rep is not None:
                     self.reports[(label, n, g)] = rep
@@ -84,8 +90,9 @@ class Series:
     def panels(self) -> list[Panel]:
         return list(dict.fromkeys((grid, decomp) for grid, decomp, *_ in self.cells))
 
-    def curves(self, panel: Panel) -> list[tuple[str, str]]:
-        return list(dict.fromkeys((t, hp) for grid, decomp, t, hp, _ in self.cells
+    def curves(self, panel: Panel) -> list[tuple[str, str, str]]:
+        """``(transport, hp_halo, overlap)`` of every curve of a panel."""
+        return list(dict.fromkeys((t, hp, ov) for grid, decomp, t, hp, ov, _ in self.cells
                                   if (grid, decomp) == panel))
 
     def gpus(self, panel: Panel) -> list[int]:
@@ -94,22 +101,27 @@ class Series:
     def max_gpus(self) -> int:
         return max(g for *_, g in self.cells)
 
-    def get(self, panel: Panel, t: str, hp: str, n: int, g: int) -> lr.Report | None:
-        return self.reports.get((sc.label(*panel, t, hp), n, g))
+    def get(self, panel: Panel, t: str, hp: str, n: int, g: int,
+            ov: str | None = None) -> lr.Report | None:
+        """The report of one cell; ``ov`` defaults to the global overlap."""
+        tag = sc.overlap_tag(self.cfg, self.overlap if ov is None else ov)
+        return self.reports.get((sc.label(*panel, t, hp, tag), n, g))
 
     def ref_mlups(self, n: int) -> float | None:
         ref = self.refs.get(n)
         return None if ref is None else ref.mlups
 
     def process_grid(self, panel: Panel, g: int) -> str | None:
-        labels = {sc.label(*panel, t, hp) for t, hp in self.curves(panel)}
+        labels = {sc.label(*panel, t, hp, sc.overlap_tag(self.cfg, ov))
+                  for t, hp, ov in self.curves(panel)}
         for (label, _, gg), rep in self.reports.items():
             if gg == g and label in labels:
                 return rep.process_grid
         return None
 
     def describe(self) -> str:
-        return lr.describe(next(iter(self.reports.values())))
+        overlap = "per curve" if len(self.cfg["overlaps"]) > 1 else None
+        return lr.describe(next(iter(self.reports.values())), overlap)
 
 
 def panel_title(panel: Panel) -> str:
@@ -119,8 +131,9 @@ def panel_title(panel: Panel) -> str:
     return lr.GRID_TITLES[grid]
 
 
-def curve_label(t: str, hp: str) -> str:
-    return lr.TRANSPORT_NAMES[t] + (" + hp-halo" if hp == "on" else "")
+def curve_label(t: str, hp: str, ov_tag: str = "") -> str:
+    return (lr.TRANSPORT_NAMES[t] + (" + hp-halo" if hp == "on" else "")
+            + (f", overlap {ov_tag}" if ov_tag else ""))
 
 
 def subplots(n_panels: int):
@@ -138,11 +151,16 @@ def subplots(n_panels: int):
     return fig, flat[:n_panels]
 
 
-def plot_curve(ax, pts: dict[int, float], t: str, hp: str) -> None:
+def curve_style(hp: str, ov_tag: str) -> tuple[str, str]:
+    """``(marker, linestyle)``: by hp-halo, dotted squares for a non-default overlap."""
+    return lr.OVERLAP_STYLE if ov_tag else lr.HP_STYLES[hp]
+
+
+def plot_curve(ax, pts: dict[int, float], t: str, hp: str, ov_tag: str = "") -> None:
     xs = sorted(pts)
-    marker, ls = lr.HP_STYLES[hp]
+    marker, ls = curve_style(hp, ov_tag)
     ax.plot(xs, [pts[x] for x in xs], marker=marker, ls=ls, lw=1.8, ms=5,
-            color=lr.TRANSPORT_COLORS[t], label=curve_label(t, hp))
+            color=lr.TRANSPORT_COLORS[t], label=curve_label(t, hp, ov_tag))
 
 
 def gpu_axis(ax, s: Series, panel: Panel, gpus: list[int]) -> None:
@@ -182,11 +200,11 @@ def plot_vs_gpus(s: Series, n: int, output: Path, show: bool) -> bool:
         gpus = s.gpus(panel)
         if 1 not in gpus:
             ax.plot([1], [ref], "*", color="black", ms=11, label="1-GPU reference")
-        for t, hp in s.curves(panel):
+        for t, hp, ov in s.curves(panel):
             pts = {g: rep.mlups_per_gpu for g in gpus
-                   if (rep := s.get(panel, t, hp, n, g)) is not None}
+                   if (rep := s.get(panel, t, hp, n, g, ov)) is not None}
             if pts:
-                plot_curve(ax, pts, t, hp)
+                plot_curve(ax, pts, t, hp, sc.overlap_tag(s.cfg, ov))
         ax.set_title(panel_title(panel))
         ax.set_ylim(bottom=0.0, top=max(ax.get_ylim()[1], ref * 1.15))
         ax.grid(True, ls=":", alpha=0.5)
@@ -211,12 +229,12 @@ def plot_vs_n(s: Series, g: int, output: Path, show: bool) -> bool:
         ax.plot(sizes, [s.ref_mlups(n) for n in sizes], "--", color="#888888", lw=1.2,
                 marker=".", label="Ideal (1-GPU reference)")
         has_runs = False
-        for t, hp in s.curves(panel):
+        for t, hp, ov in s.curves(panel):
             pts = {n: rep.mlups_per_gpu for n in sizes
-                   if (rep := s.get(panel, t, hp, n, g)) is not None}
+                   if (rep := s.get(panel, t, hp, n, g, ov)) is not None}
             if pts:
                 has_runs = True
-                plot_curve(ax, pts, t, hp)
+                plot_curve(ax, pts, t, hp, sc.overlap_tag(s.cfg, ov))
         pg = s.process_grid(panel, g) if panel[0] in sc.DISTRIBUTED_GRIDS else None
         ax.set_title(panel_title(panel) + (f", {pg}" if pg else ""))
         size_axis(ax, sizes)
@@ -242,7 +260,7 @@ def plot_hp_speedup(s: Series, out_dir: Path, show: bool) -> bool:
     panels = s.panels()
     wrote = False
     for t in s.cfg["transports"]:
-        tp = [p for p in panels if (t, "on") in s.curves(p)]
+        tp = [p for p in panels if (t, "on", s.overlap) in s.curves(p)]
         if not tp:
             continue
         fig, axes = subplots(len(tp))
@@ -275,11 +293,12 @@ def plot_hp_speedup(s: Series, out_dir: Path, show: bool) -> bool:
 TRANSPORT_TAGS = {"intra": "P", "mpi": "N", "mpip2p": "M"}
 
 
-def best_tag(grid: str, decomp: str, t: str, hp: str) -> str:
+def best_tag(grid: str, decomp: str, t: str, hp: str, ov_tag: str = "") -> str:
     tag = TRANSPORT_TAGS[t]
     if grid in sc.DISTRIBUTED_GRIDS:
-        tag += decomp[0]
-    return tag + ("+hp" if hp == "on" else "")
+        base, mode = sc.split_decomposition(decomp)
+        tag += base[0] + ("d" if mode == "direct" else "")
+    return tag + ("+hp" if hp == "on" else "") + (f"/{ov_tag}" if ov_tag else "")
 
 
 def plot_grids(s: Series, n: int, output: Path, show: bool) -> bool:
@@ -306,7 +325,7 @@ def plot_grids(s: Series, n: int, output: Path, show: bool) -> bool:
         color, marker = lr.GRID_STYLES[grid]
         style = dict(color=color, marker=marker, lw=1.8, ms=5, label=lr.GRID_TITLES[grid])
         panel = (grid, "slab")
-        if (t0, hp0) in s.curves(panel):
+        if (t0, hp0, s.overlap) in s.curves(panel):
             pts = {g: rep.mlups_per_gpu for g in s.gpus(panel)
                    if (rep := s.get(panel, t0, hp0, n, g)) is not None}
             if pts:
@@ -314,12 +333,13 @@ def plot_grids(s: Series, n: int, output: Path, show: bool) -> bool:
                 same.plot(xs, [pts[g] for g in xs], **style)
                 has_runs = True
         winners: dict[int, tuple[float, str]] = {}
-        for gr, decomp, t, hp, g in s.cells:
+        for gr, decomp, t, hp, ov, g in s.cells:
             if gr != grid:
                 continue
-            rep = s.get((gr, decomp), t, hp, n, g)
+            rep = s.get((gr, decomp), t, hp, n, g, ov)
             if rep is not None and rep.mlups_per_gpu > winners.get(g, (0.0, ""))[0]:
-                winners[g] = (rep.mlups_per_gpu, best_tag(gr, decomp, t, hp))
+                winners[g] = (rep.mlups_per_gpu,
+                              best_tag(gr, decomp, t, hp, sc.overlap_tag(s.cfg, ov)))
         if winners:
             xs = sorted(winners)
             best.plot(xs, [winners[g][0] for g in xs], **style)
@@ -354,7 +374,9 @@ def plot_grids(s: Series, n: int, output: Path, show: bool) -> bool:
     key.text(0.0, 1.0, "Fastest configuration", fontsize=9, weight="bold", va="bottom",
              transform=key.transAxes)
     key.text(0.0, 0.0, "P = Peeraccess, N = NCCL, M = MPI (P2P); s / p / b = slab / pencil / "
-             "brick (distributed grids); +hp = hp-halo on", fontsize=8, color="#555555",
+             "brick (distributed grids), pd / bd = pencil / brick with direct halo; +hp = hp-halo on; "
+             "/mode = overlap mode when not the sweep's",
+             fontsize=8, color="#555555",
              transform=key.transAxes)
     fig.suptitle(f"Carbon LBM grids at N={n}: MLUPS per GPU\n{s.describe()}"
                  + (f"; ideal: 1-GPU {s.ref_name}" if ref is not None else ""),
@@ -363,11 +385,59 @@ def plot_grids(s: Series, n: int, output: Path, show: bool) -> bool:
     return True
 
 
+def plot_direct_speedup(s: Series, output: Path, show: bool) -> bool:
+    import matplotlib.pyplot as plt
+
+    pairs = [(panel, (panel[0], panel[1] + sc.DIRECT_SUFFIX)) for panel in s.panels()
+             if (panel[0], panel[1] + sc.DIRECT_SUFFIX) in s.panels()]
+    if not pairs:
+        return False
+    sizes = s.cfg["sizes"]
+    cmap = plt.get_cmap("viridis")
+    fig, axes = subplots(len(pairs))
+    has_runs = False
+    for ax, (staged, direct) in zip(axes, pairs):
+        gpus = sorted(set(s.gpus(staged)) & set(s.gpus(direct)))
+        for i, g in enumerate(gpus):
+            for t, hp, ov in s.curves(direct):
+                xs, ys = [], []
+                for n in sizes:
+                    a, b = s.get(direct, t, hp, n, g, ov), s.get(staged, t, hp, n, g, ov)
+                    if a is not None and b is not None:
+                        xs.append(n)
+                        ys.append(a.mlups / b.mlups)
+                if not xs:
+                    continue
+                has_runs = True
+                tag = sc.overlap_tag(s.cfg, ov)
+                marker, ls = curve_style(hp, tag)
+                pg = s.process_grid(direct, g)
+                ax.plot(xs, ys, marker=marker, ls=ls, lw=1.5, ms=5,
+                        color=cmap(0.85 * i / max(1, len(gpus) - 1)),
+                        label=f"{g} GPUs" + (f" ({pg})" if pg else "") + ", "
+                        + curve_label(t, hp, tag))
+        ax.axhline(1.0, color="gray", ls="--", lw=0.8)
+        ax.set_title(f"{panel_title(staged)}: direct / staged")
+        size_axis(ax, sizes)
+        ax.grid(True, ls=":", alpha=0.5)
+        ax.legend(loc="best", fontsize=7)
+    if not has_runs:
+        plt.close(fig)
+        return False
+    for ax in axes[::min(3, len(pairs))]:
+        ax.set_ylabel("MLUPS(direct halo) / MLUPS(staged halo)")
+    fig.suptitle(f"Carbon LBM direct vs staged halo exchange\n{s.describe()}", fontsize=10,
+                 y=1.02)
+    fig.tight_layout()
+    lr.save(fig, output, show)
+    return True
+
+
 def main() -> int:
     args = parse_args()
     try:
         exps, json_dir, plots_dir = lr.experiments(
-            args, ("vs_gpus", "hp_speedup", "grids", "vs_n"))
+            args, ("vs_gpus", "hp_speedup", "grids", "vs_n", "direct_speedup"))
     except (sc.SweepConfigError, ValueError) as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
@@ -396,6 +466,9 @@ def main() -> int:
             if "grids" in plots:
                 for n in exp["sizes"]:
                     wrote |= plot_grids(s, n, out_dir / f"{series}-grids-n{n}.png", args.show)
+            if "direct_speedup" in plots:
+                wrote |= plot_direct_speedup(s, out_dir / f"{series}-direct-speedup.png",
+                                             args.show)
     return 0 if wrote else 1
 
 
